@@ -9,19 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `Store::materialize_to_sink`: dump a stream's current head state to a
-  named sink immediately, without a synthetic label or waiting for
-  `catch_up`. Sink errors propagate to the caller; the sink's checkpoint is
-  left untouched (closes #6).
-- `Store::label_delete` + `ProjectionSink::on_label_deleted`: remove a label
-  and notify sinks so they can react (e.g. `FileProjection` archives the
-  rendered `<label>.md` instead of leaving a stale file behind) (closes #7).
-
 ### Changed
-
-- `EventBackend`: added required method `label_delete` (breaking — every
-  backend implementation must now provide label removal; `ai-store-mem` and
-  `ai-store-sqlite` both do).
 
 ### Deprecated
 
@@ -30,6 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 ### Security
+
+## [0.3.0] - 2026-07-04
+
+### Added
+
+- `Store::materialize_to_sink(stream, sink_id, at: Option<Seq>)`: dump a
+  stream's state — at `at`, or the current head when `at` is `None` — to a
+  named sink immediately, without a synthetic label or waiting for
+  `catch_up`. Sink errors propagate to the caller; the sink's checkpoint is
+  left untouched (closes #6).
+- `Store::label_delete` + `ProjectionSink::on_label_deleted`: remove a label
+  and notify sinks so they can react (e.g. `FileProjection` archives the
+  rendered `<label>.md` instead of leaving a stale file behind). Idempotent:
+  deleting a label that is not defined returns `Ok(false)` rather than an
+  error, and dispatches no sink notification (closes #7).
+
+### Changed
+
+- `EventBackend`: added required method `label_delete` (breaking — every
+  backend implementation must now provide label removal; `ai-store-mem` and
+  `ai-store-sqlite` both do).
 
 ## [0.2.0] - 2026-07-04
 
