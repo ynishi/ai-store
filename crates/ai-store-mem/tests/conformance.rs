@@ -281,6 +281,41 @@ async fn seq_at_time_on_unknown_stream_returns_none() {
 }
 
 #[tokio::test]
+async fn label_delete_removes_an_existing_label() {
+    let be = MemEventBackend::new();
+    let s = StreamId::new("s");
+    let v = Label::new("v1");
+
+    be.append(&s, new_event("k", empty_patch())).await.unwrap();
+    be.label_set(&s, &v, Seq(1)).await.unwrap();
+    assert_eq!(be.label_resolve(&s, &v).await.unwrap(), Some(Seq(1)));
+
+    let existed = be.label_delete(&s, &v).await.unwrap();
+    assert!(existed);
+    assert_eq!(be.label_resolve(&s, &v).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn label_delete_of_unknown_label_reports_not_found() {
+    let be = MemEventBackend::new();
+    let s = StreamId::new("s");
+
+    be.append(&s, new_event("k", empty_patch())).await.unwrap();
+    let existed = be.label_delete(&s, &Label::new("nope")).await.unwrap();
+    assert!(!existed);
+}
+
+#[tokio::test]
+async fn label_delete_on_unknown_stream_reports_not_found() {
+    let be = MemEventBackend::new();
+    let existed = be
+        .label_delete(&StreamId::new("nope"), &Label::new("v1"))
+        .await
+        .unwrap();
+    assert!(!existed);
+}
+
+#[tokio::test]
 async fn event_patch_round_trips_through_append_and_read() {
     let be = MemEventBackend::new();
     let s = StreamId::new("s");

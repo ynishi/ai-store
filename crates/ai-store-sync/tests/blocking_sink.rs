@@ -8,19 +8,21 @@ use std::sync::{
 };
 
 use ai_store_core::{
-    CatchUpReport, Event, Patch, Seq, Store, StoreConfig, StoreError, StreamId,
+    CatchUpReport, Event, Label, Patch, Seq, Store, StoreConfig, StoreError, StreamId,
 };
 use ai_store_mem::{MemCacheBackend, MemEventBackend};
 use ai_store_sync::{BlockingSink, Dispatch, SyncProjectionSink};
 use serde_json::{json, Value};
 
 /// A minimal `SyncProjectionSink` that records the `(seq, state)` pairs it
-/// was asked to apply. Backing storage is a `Mutex<Vec<...>>`, which is
-/// safe under either `Inline` or `SpawnBlocking` dispatch.
+/// was asked to apply, plus every label it was asked to delete. Backing
+/// storage is a `Mutex<Vec<...>>`, which is safe under either `Inline` or
+/// `SpawnBlocking` dispatch.
 struct RecorderSink {
     id: String,
     log: Mutex<Vec<(Seq, Value)>>,
     commit_calls: AtomicUsize,
+    deleted_labels: Mutex<Vec<String>>,
 }
 
 impl RecorderSink {
@@ -29,6 +31,7 @@ impl RecorderSink {
             id: id.into(),
             log: Mutex::new(Vec::new()),
             commit_calls: AtomicUsize::new(0),
+            deleted_labels: Mutex::new(Vec::new()),
         }
     }
 }
@@ -46,6 +49,13 @@ impl SyncProjectionSink for RecorderSink {
     ) -> Result<(), StoreError> {
         self.commit_calls.fetch_add(1, Ordering::SeqCst);
         self.log.lock().unwrap().push((seq, state.clone()));
+        Ok(())
+    }
+    fn on_label_deleted(&self, _stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        self.deleted_labels
+            .lock()
+            .unwrap()
+            .push(label.as_str().to_string());
         Ok(())
     }
 }
@@ -157,6 +167,41 @@ async fn inline_dispatch_records_every_event() {
     let report = store.catch_up("recorder").await.unwrap();
     assert_eq!(report, CatchUpReport::EMPTY);
     assert_eq!(inner.commit_calls.load(Ordering::SeqCst), 2);
+}
+
+/// `on_label_deleted` is dispatched through the same `SpawnBlocking` path as
+/// `commit`, and reaches the wrapped sync sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_blocking_dispatch_delivers_on_label_deleted() {
+    let sink = BlockingSink::new(RecorderSink::new("recorder"));
+    let inner = Arc::clone(sink.inner());
+    let bs = Arc::new(sink);
+    let store = build_store_with_sink(bs);
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .label_set(&s, &ai_store_core::Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    store
+        .label_delete(&s, &ai_store_core::Label::new("v1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inner.deleted_labels.lock().unwrap().clone(),
+        vec!["v1".to_string()]
+    );
 }
 
 /// Dispatch mode is exposed for consumer introspection.

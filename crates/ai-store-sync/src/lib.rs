@@ -204,6 +204,17 @@ impl BlockingStore {
         self.driver.block_on(self.inner.labels(stream))
     }
 
+    /// See [`Store::label_delete`].
+    pub fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        self.driver.block_on(self.inner.label_delete(stream, label))
+    }
+
+    /// See [`Store::materialize_to_sink`].
+    pub fn materialize_to_sink(&self, sink_id: &str, stream: &StreamId) -> Result<Seq, StoreError> {
+        self.driver
+            .block_on(self.inner.materialize_to_sink(sink_id, stream))
+    }
+
     /// See [`Store::catch_up`].
     pub fn catch_up(&self, sink_id: &str) -> Result<ai_store_core::CatchUpReport, StoreError> {
         self.driver.block_on(self.inner.catch_up(sink_id))

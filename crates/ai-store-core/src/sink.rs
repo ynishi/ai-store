@@ -52,6 +52,20 @@ pub trait ProjectionSink: Send + Sync {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+
+    /// React to a label being deleted.
+    ///
+    /// Called from the facade after `Store::label_delete` succeeds. Unlike
+    /// `on_label_set` there is no `Seq` or materialized `state` argument —
+    /// the label's target has already been forgotten by the backend by the
+    /// time this fires. The default implementation is a no-op; sinks that
+    /// render label snapshots (e.g. a `<label>.md` file per label) override
+    /// this to archive or remove the rendered artifact. Implementations must
+    /// be idempotent — the same `(stream, label)` may arrive more than once
+    /// after retries or a crash-and-catch-up.
+    async fn on_label_deleted(&self, _stream: &StreamId, _label: &Label) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// Summary returned from `Store::catch_up` and `Store::rebuild`.

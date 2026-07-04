@@ -61,6 +61,12 @@ pub trait SyncProjectionSink: Send + Sync + 'static {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+
+    /// React to a label being deleted. Default is a no-op, matching the
+    /// async trait's default.
+    fn on_label_deleted(&self, _stream: &StreamId, _label: &Label) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// How [`BlockingSink`] hands off calls to the wrapped
@@ -135,11 +141,9 @@ impl<T: SyncProjectionSink> ProjectionSink for BlockingSink<T> {
                 let stream = stream.clone();
                 let state = state.clone();
                 let event = event.clone();
-                tokio::task::spawn_blocking(move || {
-                    inner.commit(&stream, seq, &state, &event)
-                })
-                .await
-                .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
+                tokio::task::spawn_blocking(move || inner.commit(&stream, seq, &state, &event))
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
             }
         }
     }
@@ -158,11 +162,23 @@ impl<T: SyncProjectionSink> ProjectionSink for BlockingSink<T> {
                 let stream = stream.clone();
                 let label = label.clone();
                 let state = state.clone();
-                tokio::task::spawn_blocking(move || {
-                    inner.on_label_set(&stream, &label, at, &state)
-                })
-                .await
-                .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
+                tokio::task::spawn_blocking(move || inner.on_label_set(&stream, &label, at, &state))
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
+            }
+        }
+    }
+
+    async fn on_label_deleted(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        match self.dispatch {
+            Dispatch::Inline => self.inner.on_label_deleted(stream, label),
+            Dispatch::SpawnBlocking => {
+                let inner = Arc::clone(&self.inner);
+                let stream = stream.clone();
+                let label = label.clone();
+                tokio::task::spawn_blocking(move || inner.on_label_deleted(&stream, &label))
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
             }
         }
     }

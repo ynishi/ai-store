@@ -582,6 +582,200 @@ async fn append_fast_path_preserves_state_semantics() {
     assert_eq!(store.head(&s).await.unwrap(), Some(Seq(5)));
 }
 
+// ---- label_delete --------------------------------------------------------
+
+#[derive(Default)]
+struct LabelDeleteRecordSink {
+    id: String,
+    deleted: StdMutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ProjectionSink for LabelDeleteRecordSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        _stream: &StreamId,
+        _seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    async fn on_label_deleted(&self, _stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        self.deleted
+            .lock()
+            .unwrap()
+            .push(label.as_str().to_string());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn label_delete_removes_label_and_notifies_sinks() {
+    let sink = Arc::new(LabelDeleteRecordSink {
+        id: "ld".to_string(),
+        deleted: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    store.label_delete(&s, &Label::new("v1")).await.unwrap();
+
+    let err = store
+        .label_resolve(&s, &Label::new("v1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "v1"));
+    assert_eq!(sink.deleted.lock().unwrap().clone(), vec!["v1".to_string()]);
+}
+
+#[tokio::test]
+async fn label_delete_of_unknown_label_returns_unknown_label_error() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = store
+        .label_delete(&s, &Label::new("nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "nope"));
+}
+
+// ---- materialize_to_sink -------------------------------------------------
+
+#[tokio::test]
+async fn materialize_to_sink_dumps_head_without_advancing_checkpoint() {
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(MemCacheBackend::new());
+
+    // Build history with no sink attached.
+    let store_no_sink = Store::new(
+        events.clone(),
+        cache.clone(),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc");
+    store_no_sink
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store_no_sink
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Attach a sink and dump the current head imperatively.
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store_with_sink = Store::new(
+        events,
+        cache,
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    let dumped = store_with_sink
+        .materialize_to_sink("record", &s)
+        .await
+        .unwrap();
+    assert_eq!(dumped, Seq(2));
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 2)]
+    );
+
+    // The checkpoint was not advanced by materialize_to_sink — catch_up
+    // still has to drive both events from scratch.
+    let report = store_with_sink.catch_up("record").await.unwrap();
+    assert_eq!(report.applied, 2);
+    assert_eq!(report.failed, 0);
+}
+
+#[tokio::test]
+async fn materialize_to_sink_unknown_sink_returns_error() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = store.materialize_to_sink("nope", &s).await.unwrap_err();
+    assert!(matches!(err, StoreError::UnknownSink(id) if id == "nope"));
+}
+
+#[tokio::test]
+async fn materialize_to_sink_unknown_stream_returns_error() {
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink],
+        StoreConfig::default(),
+    );
+
+    let err = store
+        .materialize_to_sink("record", &StreamId::new("nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownStream(id) if id == StreamId::new("nope")));
+}
+
 #[tokio::test]
 async fn read_by_meta_matches_json_null() {
     let store = store_no_gate_no_sink();

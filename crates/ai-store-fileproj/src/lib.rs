@@ -22,7 +22,10 @@
 //! `draft.md` reflects the head state after the most recent event. Each
 //! label produces one file whose contents are the state at the seq the
 //! label pins. When a label is moved, the previous file is archived under
-//! `_archive/` before the new one is written, so history is preserved.
+//! `_archive/` before the new one is written, so history is preserved. When
+//! a label is deleted (`Store::label_delete`), the same archival happens
+//! and nothing new is written — the last rendered snapshot survives under
+//! `_archive/`, but `<label>.md` itself is gone.
 //!
 //! ## Contract
 //!

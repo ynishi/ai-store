@@ -5,10 +5,13 @@
 //! backend, and that durability across reopen actually works (the property
 //! the memory backend cannot exercise).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use ai_store_core::{Patch, Seq, Store, StoreConfig, StreamId};
+use ai_store_core::{
+    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId,
+};
 use ai_store_sqlite::SqliteBackends;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -24,6 +27,44 @@ async fn open_facade(be: &SqliteBackends) -> Store {
         Vec::new(),
         StoreConfig::default(),
     )
+}
+
+async fn open_facade_with_sinks(be: &SqliteBackends, sinks: Vec<Arc<dyn ProjectionSink>>) -> Store {
+    Store::new(
+        Arc::new(be.events.clone()),
+        Arc::new(be.cache.clone()),
+        Vec::new(),
+        sinks,
+        StoreConfig::default(),
+    )
+}
+
+/// Minimal `ProjectionSink` recording each `(stream, seq)` it was asked to
+/// commit, for asserting dispatch counts and ordering.
+#[derive(Default)]
+struct RecordSink {
+    id: String,
+    seen: StdMutex<Vec<(String, u64)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for RecordSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        stream: &StreamId,
+        seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), seq.0));
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -295,7 +336,157 @@ async fn migrate_from_json_recipe_reconstructs_final_state() {
 
     let expected = legacy.last().unwrap().2.clone();
     assert_eq!(store.state(&s).await.unwrap(), expected);
-    assert_eq!(store.head(&s).await.unwrap(), Some(Seq(legacy.len() as u64)));
+    assert_eq!(
+        store.head(&s).await.unwrap(),
+        Some(Seq(legacy.len() as u64))
+    );
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- label_delete ---------------------------------------------------------
+
+#[tokio::test]
+async fn label_delete_removes_label_and_surfaces_unknown_label_after() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    store.label_delete(&s, &Label::new("v1")).await.unwrap();
+
+    let err = store
+        .label_resolve(&s, &Label::new("v1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "v1"));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn label_delete_of_unknown_label_returns_unknown_label_error() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = store
+        .label_delete(&s, &Label::new("nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "nope"));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- materialize_to_sink ---------------------------------------------------
+
+#[tokio::test]
+async fn materialize_to_sink_dumps_head_without_advancing_checkpoint() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store_no_sink = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store_no_sink
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store_no_sink
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store_with_sink = open_facade_with_sinks(&be, vec![sink.clone()]).await;
+
+    let dumped = store_with_sink
+        .materialize_to_sink("record", &s)
+        .await
+        .unwrap();
+    assert_eq!(dumped, Seq(2));
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 2)]
+    );
+
+    // Checkpoint untouched — catch_up still drives from scratch.
+    let report = store_with_sink.catch_up("record").await.unwrap();
+    assert_eq!(report.applied, 2);
+    assert_eq!(report.failed, 0);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn materialize_to_sink_unknown_sink_returns_error() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = store.materialize_to_sink("nope", &s).await.unwrap_err();
+    assert!(matches!(err, StoreError::UnknownSink(id) if id == "nope"));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn materialize_to_sink_unknown_stream_returns_error() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = open_facade_with_sinks(&be, vec![sink]).await;
+
+    let err = store
+        .materialize_to_sink("record", &StreamId::new("nope"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownStream(id) if id == StreamId::new("nope")));
 
     be.driver.shutdown().await.unwrap();
 }

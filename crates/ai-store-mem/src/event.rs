@@ -143,4 +143,12 @@ impl EventBackend for MemEventBackend {
         out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         Ok(out)
     }
+
+    async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().await;
+        let Some(state) = inner.get_mut(stream) else {
+            return Ok(false);
+        };
+        Ok(state.labels.remove(label).is_some())
+    }
 }

@@ -235,6 +235,67 @@ async fn draft_write_is_atomic_no_partial_file_left() {
 }
 
 #[tokio::test]
+async fn label_delete_archives_existing_label_file_and_removes_it() {
+    let dir = TempDir::new().unwrap();
+    let (store, _sink) = store_with_fileproj(dir.path());
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    let v1_path = dir.path().join("doc").join("v1.md");
+    assert!(v1_path.exists());
+
+    store.label_delete(&s, &Label::new("v1")).await.unwrap();
+
+    // The current file is gone; its last rendered content survives in the
+    // archive dir instead.
+    assert!(!v1_path.exists());
+    let archive_dir = dir.path().join("doc").join("_archive");
+    let mut archived_files: Vec<_> = std::fs::read_dir(&archive_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("v1.")
+                && e.file_name().to_string_lossy().ends_with(".md")
+        })
+        .collect();
+    assert_eq!(archived_files.len(), 1);
+    let archived_path = archived_files.remove(0).path();
+    let archived: Value =
+        serde_json::from_str(&std::fs::read_to_string(&archived_path).unwrap()).unwrap();
+    assert_eq!(archived, json!({ "n": 1 }));
+}
+
+#[tokio::test]
+async fn on_label_deleted_is_a_no_op_when_no_file_was_ever_written() {
+    let dir = TempDir::new().unwrap();
+    let sink = FileProjection::with_json_pretty("fs", dir.path());
+    let s = StreamId::new("doc");
+
+    // Calling the sink hook directly (bypassing the facade, which would
+    // otherwise require the label to exist in the backend first) — proves
+    // the sink itself tolerates a missing file.
+    sink.on_label_deleted(&s, &Label::new("never-set"))
+        .await
+        .unwrap();
+
+    // No stream dir, no archive dir — nothing was created.
+    assert!(!dir.path().join("doc").exists());
+}
+
+#[tokio::test]
 async fn catch_up_replays_events_and_reconciles_draft_md() {
     // Simulate a sink that only starts observing partway through: build a
     // store, append twice, THEN attach a fresh projection via rebuild.

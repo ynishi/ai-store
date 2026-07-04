@@ -39,6 +39,10 @@ pub enum StoreError {
     /// Requested label is not defined on the stream.
     #[error("unknown label: {0}")]
     UnknownLabel(String),
+
+    /// Requested sink id is not registered on the store.
+    #[error("unknown sink: {0}")]
+    UnknownSink(String),
 }
 
 /// Rejection payload emitted by a `SchemaGate` implementation.

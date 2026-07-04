@@ -111,6 +111,17 @@ pub trait EventBackend: Send + Sync {
 
     /// Enumerate all labels on a stream.
     async fn labels(&self, stream: &StreamId) -> Result<Vec<(Label, Seq)>, StoreError>;
+
+    /// Remove a label from a stream, if it exists.
+    ///
+    /// Returns `true` when the label was present and has been removed, `false`
+    /// when it was not defined. This mirrors `label_resolve`'s `Option` shape
+    /// for "not found" rather than a bespoke error variant — the facade is
+    /// responsible for turning `false` into `StoreError::UnknownLabel`.
+    ///
+    /// Only the mutable label index is affected; the append-only event log
+    /// this label pointed into is untouched.
+    async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError>;
 }
 
 /// Materialization cache for reconstructed stream states.

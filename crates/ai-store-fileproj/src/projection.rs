@@ -57,6 +57,37 @@ impl FileProjection {
         let slug = sanitize_component(stream.as_str(), "stream")?;
         Ok(self.root.join(slug))
     }
+
+    /// Move `target` (the current rendered file for `label_slug`, if it
+    /// exists) into `<dir>/_archive/<label_slug>.<epoch-ms>.md`. A no-op
+    /// when `target` does not exist.
+    ///
+    /// Shared by `on_label_set` (archive-then-rewrite) and `on_label_deleted`
+    /// (archive-only — the store's label index is the source of truth for
+    /// whether a label exists, so the sink preserves the last rendered
+    /// snapshot rather than deleting it outright).
+    async fn archive_if_exists(
+        &self,
+        dir: &Path,
+        label_slug: &str,
+        target: &Path,
+    ) -> Result<(), StoreError> {
+        if fs::try_exists(target)
+            .await
+            .map_err(|e| StoreError::Backend(format!("exists {target:?}: {e}")))?
+        {
+            let archive_dir = dir.join("_archive");
+            fs::create_dir_all(&archive_dir)
+                .await
+                .map_err(|e| StoreError::Backend(format!("mkdir {archive_dir:?}: {e}")))?;
+            let now = Timestamp::now().0;
+            let archived = archive_dir.join(format!("{label_slug}.{now}.md"));
+            fs::rename(target, &archived).await.map_err(|e| {
+                StoreError::Backend(format!("archive {target:?} -> {archived:?}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Reject path components that could escape the projection root or produce
@@ -141,22 +172,16 @@ impl ProjectionSink for FileProjection {
         let target = dir.join(format!("{label_slug}.md"));
 
         // Archive any existing file for this label before overwriting.
-        if fs::try_exists(&target)
-            .await
-            .map_err(|e| StoreError::Backend(format!("exists {target:?}: {e}")))?
-        {
-            let archive_dir = dir.join("_archive");
-            fs::create_dir_all(&archive_dir)
-                .await
-                .map_err(|e| StoreError::Backend(format!("mkdir {archive_dir:?}: {e}")))?;
-            let now = Timestamp::now().0;
-            let archived = archive_dir.join(format!("{label_slug}.{now}.md"));
-            fs::rename(&target, &archived).await.map_err(|e| {
-                StoreError::Backend(format!("archive {target:?} -> {archived:?}: {e}"))
-            })?;
-        }
+        self.archive_if_exists(&dir, &label_slug, &target).await?;
 
         let body = (self.render)(state);
         write_atomic(&target, &body).await
+    }
+
+    async fn on_label_deleted(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        let label_slug = sanitize_component(label.as_str(), "label")?;
+        let dir = self.stream_dir(stream)?;
+        let target = dir.join(format!("{label_slug}.md"));
+        self.archive_if_exists(&dir, &label_slug, &target).await
     }
 }

@@ -164,7 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `legacy_at_ms` — exercises `read_by_meta` (Issue #2) on the same
     // metadata carried during migration.
     let hits = store
-        .read_by_meta(&stream, "legacy_at_ms", &json!(1_700_000_060_000_i64), Seq(1), 10)
+        .read_by_meta(
+            &stream,
+            "legacy_at_ms",
+            &json!(1_700_000_060_000_i64),
+            Seq(1),
+            10,
+        )
         .await?;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].kind, "update_title");

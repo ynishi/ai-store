@@ -368,6 +368,22 @@ impl EventBackend for SqliteEventBackend {
             .map(|(n, s)| (Label(n), Seq(s as u64)))
             .collect())
     }
+
+    async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
+        let stream_name = stream.as_str().to_string();
+        let label_name = label.as_str().to_string();
+        let changed = self
+            .isle
+            .call(move |conn| {
+                conn.execute(
+                    "DELETE FROM labels WHERE stream = ?1 AND name = ?2",
+                    params![stream_name, label_name],
+                )
+            })
+            .await
+            .map_err(to_store_err)?;
+        Ok(changed > 0)
+    }
 }
 
 #[async_trait]
