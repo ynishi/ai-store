@@ -163,7 +163,8 @@ async fn borrowed_handle_from_spawn_blocking() {
 }
 
 /// `BlockingStore::label_delete` mirrors `Store::label_delete`: it removes
-/// the label and a subsequent `label_resolve` surfaces `UnknownLabel`.
+/// the label and a subsequent `label_resolve` surfaces `UnknownLabel`, while
+/// the delete itself is idempotent (`Ok(bool)`, never an error).
 #[test]
 fn label_delete_removes_label_via_blocking_facade() {
     let bs = BlockingStore::new(build_store()).expect("runtime");
@@ -178,14 +179,15 @@ fn label_delete_removes_label_via_blocking_facade() {
     .unwrap();
     bs.label_set(&s, &Label::new("v1"), Seq(1)).unwrap();
 
-    bs.label_delete(&s, &Label::new("v1")).unwrap();
+    let existed = bs.label_delete(&s, &Label::new("v1")).unwrap();
+    assert!(existed);
 
     let err = bs.label_resolve(&s, &Label::new("v1")).unwrap_err();
     assert!(matches!(err, StoreError::UnknownLabel(name) if name == "v1"));
 
-    // Deleting an already-gone label reports the same error.
-    let err = bs.label_delete(&s, &Label::new("v1")).unwrap_err();
-    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "v1"));
+    // Deleting an already-gone label is idempotent: no error, just `false`.
+    let existed = bs.label_delete(&s, &Label::new("v1")).unwrap();
+    assert!(!existed);
 }
 
 /// `BlockingStore::materialize_to_sink` mirrors `Store::materialize_to_sink`:
@@ -218,13 +220,13 @@ fn materialize_to_sink_dumps_head_via_blocking_facade() {
     // effect of materialize_to_sink.
     sink.seen.lock().unwrap().clear();
 
-    let dumped = bs.materialize_to_sink("record", &s).unwrap();
+    let dumped = bs.materialize_to_sink(&s, "record", None).unwrap();
     assert_eq!(dumped, Seq(1));
     assert_eq!(
         sink.seen.lock().unwrap().clone(),
         vec![("doc".to_string(), 1)]
     );
 
-    let err = bs.materialize_to_sink("nope", &s).unwrap_err();
+    let err = bs.materialize_to_sink(&s, "nope", None).unwrap_err();
     assert!(matches!(err, StoreError::UnknownSink(id) if id == "nope"));
 }

@@ -368,27 +368,32 @@ impl Store {
 
     /// Delete `label` from `stream`.
     ///
+    /// Idempotent: deleting a label that is not defined is **not** an error.
+    /// Returns `Ok(true)` when the label existed and was removed, `Ok(false)`
+    /// when it was already absent — mirroring the backend's
+    /// [`EventBackend::label_delete`] contract. Callers that need the strict
+    /// "must have existed" behavior can match on the returned `bool`
+    /// themselves.
+    ///
     /// After the backend removes the label, every registered
-    /// [`ProjectionSink`] receives an `on_label_deleted` notification.
-    /// Sink failures are best-effort — matching the dispatch policy of
-    /// [`Store::label_set`] and [`Store::append`], a sink error does not
-    /// roll back the deletion. Deleting a label that is not defined returns
-    /// [`StoreError::UnknownLabel`].
-    pub async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+    /// [`ProjectionSink`] receives an `on_label_deleted` notification — but
+    /// only when the label actually existed (a no-op delete dispatches
+    /// nothing, since nothing changed). Sink failures are best-effort —
+    /// matching the dispatch policy of [`Store::label_set`] and
+    /// [`Store::append`], a sink error does not roll back the deletion.
+    pub async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
         let existed = self.events.label_delete(stream, label).await?;
-        if !existed {
-            return Err(StoreError::UnknownLabel(label.as_str().to_string()));
-        }
-        if !self.sinks.is_empty() {
+        if existed && !self.sinks.is_empty() {
             for sink in &self.sinks {
                 let _ = sink.on_label_deleted(stream, label).await;
             }
         }
-        Ok(())
+        Ok(existed)
     }
 
-    /// Materialize `stream`'s current state and hand it to `sink_id`
-    /// immediately, without waiting for [`Store::catch_up`] to drive it.
+    /// Materialize `stream`'s state at `at` (or the current head when `at`
+    /// is `None`) and hand it to `sink_id` immediately, without waiting for
+    /// [`Store::catch_up`] to drive it.
     ///
     /// This is the imperative "dump now" escape hatch: previously the only
     /// way to force a snapshot out of a sink was to pin a synthetic label
@@ -397,19 +402,28 @@ impl Store {
     /// is propagated to the caller — an explicit dump is expected to
     /// succeed or report why it didn't.
     ///
+    /// `at` lets a caller replay an arbitrary point in history to a sink,
+    /// not just the head — useful for backfilling a newly attached sink
+    /// with a historical snapshot without first winding the whole stream
+    /// forward through `catch_up`.
+    ///
     /// The sink's checkpoint is **not** advanced. `commit` is contracted to
     /// be idempotent (see [`ProjectionSink`]), so a subsequent `catch_up`
-    /// may re-deliver this same `(stream, head)` pair; that redelivery is
+    /// may re-deliver this same `(stream, seq)` pair; that redelivery is
     /// harmless under the same contract that makes crash recovery safe.
     /// Advancing the checkpoint here would risk skipping a gap that
     /// `catch_up` still needs to fill.
     ///
-    /// Returns `StoreError::UnknownSink` if `sink_id` is not registered, and
-    /// `StoreError::UnknownStream` if `stream` has no events.
+    /// Returns `StoreError::UnknownSink` if `sink_id` is not registered.
+    /// Returns `StoreError::UnknownStream` if `stream` has no events —
+    /// whether `at` was given or resolved from an empty head. When `at` is
+    /// `Some(seq)` beyond the stream's current head, returns
+    /// `StoreError::SeqOutOfRange` (surfaced by [`Store::state_at`]).
     pub async fn materialize_to_sink(
         &self,
-        sink_id: &str,
         stream: &StreamId,
+        sink_id: &str,
+        at: Option<Seq>,
     ) -> Result<Seq, StoreError> {
         let sink = self
             .sinks
@@ -418,18 +432,24 @@ impl Store {
             .cloned()
             .ok_or_else(|| StoreError::UnknownSink(sink_id.to_string()))?;
 
-        let Some(head) = self.events.head(stream).await? else {
-            return Err(StoreError::UnknownStream(stream.clone()));
+        let target = match at {
+            Some(seq) => seq,
+            None => self
+                .events
+                .head(stream)
+                .await?
+                .ok_or_else(|| StoreError::UnknownStream(stream.clone()))?,
         };
-        let state = self.state_at(stream, head).await?;
-        let events = self.events.read(stream, head, 1).await?;
+
+        let state = self.state_at(stream, target).await?;
+        let events = self.events.read(stream, target, 1).await?;
         let event = events
             .into_iter()
             .next()
             .ok_or_else(|| StoreError::UnknownStream(stream.clone()))?;
 
-        sink.commit(stream, head, &state, &event).await?;
-        Ok(head)
+        sink.commit(stream, target, &state, &event).await?;
+        Ok(target)
     }
 
     /// Drive `sink_id` forward from its checkpoint to head on every known

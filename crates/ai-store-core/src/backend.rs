@@ -116,8 +116,9 @@ pub trait EventBackend: Send + Sync {
     ///
     /// Returns `true` when the label was present and has been removed, `false`
     /// when it was not defined. This mirrors `label_resolve`'s `Option` shape
-    /// for "not found" rather than a bespoke error variant — the facade is
-    /// responsible for turning `false` into `StoreError::UnknownLabel`.
+    /// for "not found" rather than a bespoke error variant — the facade
+    /// (`Store::label_delete`) surfaces this `bool` verbatim, since deleting
+    /// an absent label is a no-op rather than a failure.
     ///
     /// Only the mutable label index is affected; the append-only event log
     /// this label pointed into is untouched.

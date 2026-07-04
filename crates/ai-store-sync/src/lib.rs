@@ -205,14 +205,19 @@ impl BlockingStore {
     }
 
     /// See [`Store::label_delete`].
-    pub fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+    pub fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
         self.driver.block_on(self.inner.label_delete(stream, label))
     }
 
     /// See [`Store::materialize_to_sink`].
-    pub fn materialize_to_sink(&self, sink_id: &str, stream: &StreamId) -> Result<Seq, StoreError> {
+    pub fn materialize_to_sink(
+        &self,
+        stream: &StreamId,
+        sink_id: &str,
+        at: Option<Seq>,
+    ) -> Result<Seq, StoreError> {
         self.driver
-            .block_on(self.inner.materialize_to_sink(sink_id, stream))
+            .block_on(self.inner.materialize_to_sink(stream, sink_id, at))
     }
 
     /// See [`Store::catch_up`].

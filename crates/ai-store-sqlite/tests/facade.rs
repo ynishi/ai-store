@@ -366,7 +366,8 @@ async fn label_delete_removes_label_and_surfaces_unknown_label_after() {
         .await
         .unwrap();
 
-    store.label_delete(&s, &Label::new("v1")).await.unwrap();
+    let existed = store.label_delete(&s, &Label::new("v1")).await.unwrap();
+    assert!(existed);
 
     let err = store
         .label_resolve(&s, &Label::new("v1"))
@@ -378,7 +379,7 @@ async fn label_delete_removes_label_and_surfaces_unknown_label_after() {
 }
 
 #[tokio::test]
-async fn label_delete_of_unknown_label_returns_unknown_label_error() {
+async fn label_delete_of_unknown_label_is_idempotent_and_returns_false() {
     let be = SqliteBackends::open_in_memory().await.unwrap();
     let store = open_facade(&be).await;
     let s = StreamId::new("doc");
@@ -392,11 +393,42 @@ async fn label_delete_of_unknown_label_returns_unknown_label_error() {
         .await
         .unwrap();
 
-    let err = store
-        .label_delete(&s, &Label::new("nope"))
+    let existed = store.label_delete(&s, &Label::new("nope")).await.unwrap();
+    assert!(!existed);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn label_delete_leaves_event_log_unchanged() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
         .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::UnknownLabel(name) if name == "nope"));
+        .unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    let head_before = store.head(&s).await.unwrap();
+    let events_before = store.read(&s, Seq::ZERO.next(), 10).await.unwrap();
+
+    let existed = store.label_delete(&s, &Label::new("v1")).await.unwrap();
+    assert!(existed);
+
+    let head_after = store.head(&s).await.unwrap();
+    let events_after = store.read(&s, Seq::ZERO.next(), 10).await.unwrap();
+
+    assert_eq!(head_before, head_after);
+    assert_eq!(events_before, events_after);
 
     be.driver.shutdown().await.unwrap();
 }
@@ -435,7 +467,7 @@ async fn materialize_to_sink_dumps_head_without_advancing_checkpoint() {
     let store_with_sink = open_facade_with_sinks(&be, vec![sink.clone()]).await;
 
     let dumped = store_with_sink
-        .materialize_to_sink("record", &s)
+        .materialize_to_sink(&s, "record", None)
         .await
         .unwrap();
     assert_eq!(dumped, Seq(2));
@@ -448,6 +480,92 @@ async fn materialize_to_sink_dumps_head_without_advancing_checkpoint() {
     let report = store_with_sink.catch_up("record").await.unwrap();
     assert_eq!(report.applied, 2);
     assert_eq!(report.failed, 0);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn materialize_to_sink_with_at_dumps_a_past_state() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let s = StreamId::new("doc");
+
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = open_facade_with_sinks(&be, vec![sink.clone()]).await;
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // append() already dispatched twice; isolate the effect of the explicit
+    // historical dump.
+    sink.seen.lock().unwrap().clear();
+
+    let dumped = store
+        .materialize_to_sink(&s, "record", Some(Seq(1)))
+        .await
+        .unwrap();
+    assert_eq!(dumped, Seq(1));
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1)]
+    );
+
+    // Head is still 2 — dumping a past seq did not touch the log or move
+    // the stream forward/backward.
+    assert_eq!(store.head(&s).await.unwrap(), Some(Seq(2)));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn materialize_to_sink_with_at_beyond_head_returns_seq_out_of_range() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let s = StreamId::new("doc");
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = open_facade_with_sinks(&be, vec![sink]).await;
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = store
+        .materialize_to_sink(&s, "record", Some(Seq(5)))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::SeqOutOfRange {
+            head: Some(Seq(1)),
+            requested: Seq(5)
+        }
+    ));
 
     be.driver.shutdown().await.unwrap();
 }
@@ -467,7 +585,10 @@ async fn materialize_to_sink_unknown_sink_returns_error() {
         .await
         .unwrap();
 
-    let err = store.materialize_to_sink("nope", &s).await.unwrap_err();
+    let err = store
+        .materialize_to_sink(&s, "nope", None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::UnknownSink(id) if id == "nope"));
 
     be.driver.shutdown().await.unwrap();
@@ -483,7 +604,7 @@ async fn materialize_to_sink_unknown_stream_returns_error() {
     let store = open_facade_with_sinks(&be, vec![sink]).await;
 
     let err = store
-        .materialize_to_sink("record", &StreamId::new("nope"))
+        .materialize_to_sink(&StreamId::new("nope"), "record", None)
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::UnknownStream(id) if id == StreamId::new("nope")));
