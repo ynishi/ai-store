@@ -37,6 +37,50 @@ pub trait EventBackend: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Event>, StoreError>;
 
+    /// Read events whose top-level `meta[field]` equals `value`, scanning
+    /// forward from `from` and returning at most `limit` matches.
+    ///
+    /// `field` is a single top-level key of the event's `meta` object; nested
+    /// paths are out of scope for this method. Callers that need deeper
+    /// matching should post-filter after [`EventBackend::read`].
+    ///
+    /// The default implementation pages through [`EventBackend::read`] and
+    /// filters client-side — it is O(N) in the number of events scanned.
+    /// Backends that can index `meta` (e.g. SQLite via `json_extract`) should
+    /// override this method for sub-linear lookups.
+    async fn read_by_meta(
+        &self,
+        stream: &StreamId,
+        field: &str,
+        value: &Value,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const BATCH: usize = 128;
+        let mut out = Vec::new();
+        let mut cursor = from;
+        loop {
+            let events = self.read(stream, cursor, BATCH).await?;
+            if events.is_empty() {
+                break;
+            }
+            let last_seq = events.last().unwrap().seq;
+            for ev in events {
+                if ev.meta.get(field) == Some(value) {
+                    out.push(ev);
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            cursor = last_seq.next();
+        }
+        Ok(out)
+    }
+
     /// Current head coordinate. `None` if the stream has no events.
     async fn head(&self, stream: &StreamId) -> Result<Option<Seq>, StoreError>;
 

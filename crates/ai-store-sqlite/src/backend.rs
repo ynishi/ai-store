@@ -138,6 +138,82 @@ impl EventBackend for SqliteEventBackend {
             .collect()
     }
 
+    async fn read_by_meta(
+        &self,
+        stream: &StreamId,
+        field: &str,
+        value: &Value,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stream_name = stream.as_str().to_string();
+        let from_i = from.0 as i64;
+        let limit_i = limit as i64;
+        // Quote the field name so keys containing dots or reserved chars route
+        // to a genuine top-level lookup rather than a nested traversal.
+        let escaped = field.replace('\\', "\\\\").replace('"', "\\\"");
+        let path = format!("$.\"{}\"", escaped);
+        let is_null = value.is_null();
+        let value_json = serde_json::to_string(value).map_err(to_store_err)?;
+
+        let rows = self
+            .isle
+            .call(move |conn| {
+                // JSON null vs missing field both surface as SQL NULL through
+                // `json_extract`, so we branch on the Rust-side type: match
+                // JSON null via `json_type(...) = 'null'` when the caller
+                // asked for null, and use canonical-form equality otherwise.
+                let sql = if is_null {
+                    "SELECT seq, kind, patch, meta, at_ms FROM events \
+                     WHERE stream = ?1 AND seq >= ?2 \
+                       AND json_type(meta, ?3) = 'null' \
+                     ORDER BY seq ASC LIMIT ?4"
+                } else {
+                    "SELECT seq, kind, patch, meta, at_ms FROM events \
+                     WHERE stream = ?1 AND seq >= ?2 \
+                       AND json_extract(meta, ?3) = json_extract(?4, '$') \
+                     ORDER BY seq ASC LIMIT ?5"
+                };
+                let mut stmt = conn.prepare(sql)?;
+                let rows: Result<Vec<_>, rusqlite::Error> = if is_null {
+                    stmt.query_map(params![stream_name, from_i, path, limit_i], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                        ))
+                    })?
+                    .collect()
+                } else {
+                    stmt.query_map(
+                        params![stream_name, from_i, path, value_json, limit_i],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, i64>(4)?,
+                            ))
+                        },
+                    )?
+                    .collect()
+                };
+                rows
+            })
+            .await
+            .map_err(to_store_err)?;
+
+        rows.into_iter()
+            .map(|(s, k, p, m, t)| row_to_event(s as u64, k, p, m, t))
+            .collect()
+    }
+
     async fn head(&self, stream: &StreamId) -> Result<Option<Seq>, StoreError> {
         let stream_name = stream.as_str().to_string();
         let head: Option<i64> = self

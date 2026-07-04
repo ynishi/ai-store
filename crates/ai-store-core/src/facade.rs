@@ -23,6 +23,53 @@
 //! will re-drive every sink from `Seq(0)`; this is safe because sinks are
 //! contracted to be idempotent under retries. Persistent checkpoints are a
 //! deliberate follow-up (typically co-located in the `EventBackend`'s DB).
+//!
+//! ## Cost model for large stream states
+//!
+//! `Store::append` computes `next = current + patch` in memory. When the
+//! per-stream state is a large document tree (tens of MB, tens of thousands
+//! of nodes) the shape of the append hot path matters.
+//!
+//! ### Per-append memory
+//!
+//! - `current` reconstruction is O(state size) once per append (cache-nearest
+//!   + replay from the last cache entry).
+//! - When any [`crate::SchemaGate`] is registered, `next` is materialized
+//!   pre-commit for the gate loop: peak ≈ 2× state size.
+//! - When no gates are registered and the assigned `seq` misses the
+//!   [`StoreConfig::cache_stride`] boundary and no [`crate::ProjectionSink`]
+//!   is registered, `next` is not materialized at all — the fast path skips
+//!   the clone + patch entirely.
+//! - When no gates are registered but either a cache write or sink dispatch
+//!   is needed, `next` is materialized once post-commit (same total cost as
+//!   the gate path, but ordering shifts).
+//!
+//! ### Cache stride trade-off
+//!
+//! - `cache_stride = N` materializes `next` and writes it into
+//!   [`crate::CacheBackend`] every N events. Larger N → fewer JSON
+//!   serializations and backend writes, at the cost of longer replay chains
+//!   on `state_at`.
+//! - `cache_stride = 0` disables the cache entirely; every state read replays
+//!   from `Seq(0)` (or the last replay origin the backend chooses to
+//!   pin). Only sensible when the stream is short-lived or state reads are
+//!   rare.
+//! - For large states, a stride in the 256–1024 range typically balances the
+//!   two costs; measure and tune per workload.
+//!
+//! ### Stream granularity
+//!
+//! - Per-entity streams — many small states, low per-append cost, but every
+//!   stream costs some backend index / metadata overhead.
+//! - Document-level streams — one large state, high per-append cost, but
+//!   invariants that span the whole document can be enforced by a single
+//!   gate.
+//!
+//! A useful rule of thumb: split the document into per-entity streams once
+//! per-append memory (≈ 2× state size when gates run) is measured in the
+//! high-single-digit MB and no gate genuinely needs the whole document as
+//! one unit. `read_by_meta` (indexed on the SQLite backend) then answers
+//! per-entity histories without linear scans.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +133,11 @@ impl Store {
     }
 
     /// Append one event to `stream`. Returns the assigned `Seq`.
+    ///
+    /// Fast path: when no [`SchemaGate`] is registered, `next` is not
+    /// materialized pre-commit. If the assigned `seq` misses the cache stride
+    /// and no [`ProjectionSink`] is registered, `next` is not materialized at
+    /// all. See the crate-level cost-model section for the full breakdown.
     pub async fn append(
         &self,
         stream: &StreamId,
@@ -94,20 +146,38 @@ impl Store {
         meta: Value,
     ) -> Result<Seq, StoreError> {
         let current = self.state(stream).await?;
-        let mut next = current.clone();
-        json_patch::patch(&mut next, &patch)
-            .map_err(|e| StoreError::Patch(format!("gate preview: {e}")))?;
+        let has_gates = !self.gates.is_empty();
 
-        for g in &self.gates {
-            g.validate(&GateCtx {
-                stream,
-                kind,
-                patch: &patch,
-                current: &current,
-                next: &next,
-            })
-            .map_err(StoreError::Schema)?;
-        }
+        // Pre-commit next materialization is only needed when a gate will
+        // read it. Otherwise defer — post-commit paths (cache put / sink
+        // dispatch) may not need it either.
+        let precomputed_next = if has_gates {
+            let mut next = current.clone();
+            json_patch::patch(&mut next, &patch)
+                .map_err(|e| StoreError::Patch(format!("gate preview: {e}")))?;
+            for g in &self.gates {
+                g.validate(&GateCtx {
+                    stream,
+                    kind,
+                    patch: &patch,
+                    current: &current,
+                    next: &next,
+                })
+                .map_err(StoreError::Schema)?;
+            }
+            Some(next)
+        } else {
+            None
+        };
+
+        // Retain a patch clone only when we might have to reapply post-commit
+        // (no gates but cache/sink paths may still need `next`). `Patch` is
+        // `Vec<PatchOperation>` — cheap to clone relative to the state itself.
+        let patch_for_reapply = if precomputed_next.is_none() {
+            Some(patch.clone())
+        } else {
+            None
+        };
 
         let rec = NewEvent {
             kind: kind.to_string(),
@@ -116,31 +186,48 @@ impl Store {
         };
         let seq = self.events.append(stream, rec).await?;
 
-        if self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0 {
-            self.cache.put(stream, seq, &next).await?;
-        }
+        let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
+        let needs_next = cache_hit || !self.sinks.is_empty();
 
-        // Post-commit sink dispatch (best-effort; failure leaves checkpoint alone).
-        if !self.sinks.is_empty() {
-            let events = self.events.read(stream, seq, 1).await?;
-            if let Some(ev) = events.into_iter().next() {
-                for sink in &self.sinks {
-                    let key = (sink.id().to_string(), stream.clone());
-                    let checkpoint = {
-                        let cps = self.checkpoints.lock().await;
-                        cps.get(&key).copied().unwrap_or(Seq::ZERO)
-                    };
-                    // Skip if already past this seq (catch_up ran concurrently).
-                    if seq <= checkpoint {
-                        continue;
-                    }
-                    if sink.commit(stream, seq, &next, &ev).await.is_ok() {
-                        // Only advance the checkpoint contiguously. If there is
-                        // a gap (an earlier seq failed dispatch), leave the
-                        // checkpoint parked so catch_up will re-drive the gap.
-                        if seq == checkpoint.next() {
-                            let mut cps = self.checkpoints.lock().await;
-                            cps.insert(key, seq);
+        // Materialize `next` only if a downstream path actually reads it.
+        let next: Option<Value> = if let Some(n) = precomputed_next {
+            Some(n)
+        } else if needs_next {
+            let mut n = current.clone();
+            json_patch::patch(&mut n, patch_for_reapply.as_ref().unwrap())
+                .map_err(|e| StoreError::Patch(format!("post-commit reapply: {e}")))?;
+            Some(n)
+        } else {
+            None
+        };
+
+        if let Some(ref next_state) = next {
+            if cache_hit {
+                self.cache.put(stream, seq, next_state).await?;
+            }
+
+            // Post-commit sink dispatch (best-effort; failure leaves checkpoint alone).
+            if !self.sinks.is_empty() {
+                let events = self.events.read(stream, seq, 1).await?;
+                if let Some(ev) = events.into_iter().next() {
+                    for sink in &self.sinks {
+                        let key = (sink.id().to_string(), stream.clone());
+                        let checkpoint = {
+                            let cps = self.checkpoints.lock().await;
+                            cps.get(&key).copied().unwrap_or(Seq::ZERO)
+                        };
+                        // Skip if already past this seq (catch_up ran concurrently).
+                        if seq <= checkpoint {
+                            continue;
+                        }
+                        if sink.commit(stream, seq, next_state, &ev).await.is_ok() {
+                            // Only advance the checkpoint contiguously. If there is
+                            // a gap (an earlier seq failed dispatch), leave the
+                            // checkpoint parked so catch_up will re-drive the gap.
+                            if seq == checkpoint.next() {
+                                let mut cps = self.checkpoints.lock().await;
+                                cps.insert(key, seq);
+                            }
                         }
                     }
                 }
@@ -205,6 +292,21 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
         self.events.read(stream, from, limit).await
+    }
+
+    /// Enumerate events whose top-level `meta[field]` equals `value`. See
+    /// [`EventBackend::read_by_meta`].
+    pub async fn read_by_meta(
+        &self,
+        stream: &StreamId,
+        field: &str,
+        value: &Value,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.events
+            .read_by_meta(stream, field, value, from, limit)
+            .await
     }
 
     /// Current head coordinate of `stream`.

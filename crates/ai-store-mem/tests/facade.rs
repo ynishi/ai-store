@@ -469,3 +469,147 @@ async fn label_resolve_via_facade_surfaces_unknown_label_error() {
         Seq(1)
     );
 }
+
+#[tokio::test]
+async fn read_by_meta_default_impl_filters_client_side() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    // Initialize empty object so subsequent /step_N adds have a path parent.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({ "entity_id": "init" }),
+        )
+        .await
+        .unwrap();
+
+    // Seed three events: two touch entity A, one touches entity B (seqs 2..=4).
+    for (i, ent) in ["A", "B", "A"].iter().enumerate() {
+        store
+            .append(
+                &s,
+                "touch",
+                patch(json!([{ "op": "add", "path": format!("/step_{}", i), "value": ent }])),
+                json!({ "entity_id": ent }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Filter by entity A → two matches (seq 2 and seq 4).
+    let hits = store
+        .read_by_meta(&s, "entity_id", &json!("A"), Seq(2), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].seq, Seq(2));
+    assert_eq!(hits[1].seq, Seq(4));
+
+    // Limit caps at match count.
+    let capped = store
+        .read_by_meta(&s, "entity_id", &json!("A"), Seq(2), 1)
+        .await
+        .unwrap();
+    assert_eq!(capped.len(), 1);
+    assert_eq!(capped[0].seq, Seq(2));
+
+    // Non-matching value → empty.
+    let none = store
+        .read_by_meta(&s, "entity_id", &json!("Z"), Seq(1), 10)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // `from` skips earlier matches.
+    let from_mid = store
+        .read_by_meta(&s, "entity_id", &json!("A"), Seq(3), 10)
+        .await
+        .unwrap();
+    assert_eq!(from_mid.len(), 1);
+    assert_eq!(from_mid[0].seq, Seq(4));
+
+    // limit=0 short-circuits to empty.
+    let zero = store
+        .read_by_meta(&s, "entity_id", &json!("A"), Seq(1), 0)
+        .await
+        .unwrap();
+    assert!(zero.is_empty());
+}
+
+/// Verify the append fast path: gates absent, sinks absent, cache stride
+/// misses — state is still reconstructible via replay from the log, since
+/// the fast path skips both pre- and post-commit `next` materialization.
+#[tokio::test]
+async fn append_fast_path_preserves_state_semantics() {
+    // Explicit stride large enough that seqs 1..=5 all miss the boundary.
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig { cache_stride: 100 },
+    );
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    for i in 1..5 {
+        store
+            .append(
+                &s,
+                "bump",
+                patch(json!([{ "op": "replace", "path": "/n", "value": i }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // No cache entries were written (all stride misses); state must still
+    // reconstruct correctly from the log alone.
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 4 }));
+    assert_eq!(store.state_at(&s, Seq(3)).await.unwrap(), json!({ "n": 2 }));
+    assert_eq!(store.head(&s).await.unwrap(), Some(Seq(5)));
+}
+
+#[tokio::test]
+async fn read_by_meta_matches_json_null() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({ "owner": Value::Null }),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "with_value",
+            patch(json!([{ "op": "add", "path": "/x", "value": 1 }])),
+            json!({ "owner": "alice" }),
+        )
+        .await
+        .unwrap();
+
+    let hits = store
+        .read_by_meta(&s, "owner", &Value::Null, Seq(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].seq, Seq(1));
+}
