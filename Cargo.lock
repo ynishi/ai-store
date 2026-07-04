@@ -50,9 +50,23 @@ dependencies = [
  "json-patch",
  "rusqlite",
  "rusqlite-isle",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "ai-store-sync"
+version = "0.1.0"
+dependencies = [
+ "ai-store-core",
+ "ai-store-mem",
+ "async-trait",
+ "json-patch",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

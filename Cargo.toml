@@ -5,6 +5,7 @@ members = [
     "crates/ai-store-mem",
     "crates/ai-store-sqlite",
     "crates/ai-store-fileproj",
+    "crates/ai-store-sync",
 ]
 
 [workspace.package]
