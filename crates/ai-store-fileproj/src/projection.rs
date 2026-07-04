@@ -1,0 +1,162 @@
+//! `FileProjection` implementation of `ProjectionSink`.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ai_store_core::{Event, Label, ProjectionSink, Seq, StoreError, StreamId, Timestamp};
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::fs;
+
+/// Render function type: turn the materialized `Value` state into the file
+/// body that will be written to disk. Consumers plug in whatever formatter
+/// makes sense for their domain (Markdown, JSON pretty-print, plain text).
+pub type RenderFn = Arc<dyn Fn(&Value) -> String + Send + Sync>;
+
+/// A `ProjectionSink` that writes stream state to `.md` files.
+///
+/// Cloneable — the sink is holds an `Arc` to the render function so multiple
+/// consumers can share one projection.
+#[derive(Clone)]
+pub struct FileProjection {
+    id: String,
+    root: PathBuf,
+    render: RenderFn,
+}
+
+impl FileProjection {
+    /// Create a new projection with the given id, root directory, and
+    /// render function.
+    ///
+    /// The `id` is used as the checkpoint key on the facade and should be
+    /// stable across restarts.
+    pub fn new(
+        id: impl Into<String>,
+        root: impl Into<PathBuf>,
+        render: impl Fn(&Value) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            root: root.into(),
+            render: Arc::new(render),
+        }
+    }
+
+    /// Convenience constructor that pretty-prints the state as JSON.
+    ///
+    /// Useful when the consumer's state is already document-shaped and you
+    /// just want a readable dump on disk.
+    pub fn with_json_pretty(id: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+        Self::new(id, root, |v| {
+            serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+        })
+    }
+
+    /// The directory (under `root`) where files for `stream` live.
+    fn stream_dir(&self, stream: &StreamId) -> Result<PathBuf, StoreError> {
+        let slug = sanitize_component(stream.as_str(), "stream")?;
+        Ok(self.root.join(slug))
+    }
+}
+
+/// Reject path components that could escape the projection root or produce
+/// nonsense filenames on any of the platforms we target.
+fn sanitize_component(raw: &str, kind: &str) -> Result<String, StoreError> {
+    if raw.is_empty() {
+        return Err(StoreError::Backend(format!("empty {kind} name")));
+    }
+    if raw == "." || raw == ".." {
+        return Err(StoreError::Backend(format!(
+            "reserved {kind} name: {raw:?}"
+        )));
+    }
+    for ch in raw.chars() {
+        match ch {
+            '/' | '\\' | '\0' => {
+                return Err(StoreError::Backend(format!(
+                    "invalid character in {kind} name: {raw:?}"
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(raw.to_string())
+}
+
+async fn write_atomic(path: &Path, body: &str) -> Result<(), StoreError> {
+    // Write to a temp sibling then rename, so a partial write is never
+    // observed by concurrent readers of the projection tree.
+    let mut tmp = path.to_path_buf();
+    let mut tmp_name = tmp
+        .file_name()
+        .map(|s| s.to_os_string())
+        .ok_or_else(|| StoreError::Backend("target path has no filename".to_string()))?;
+    tmp_name.push(".partial");
+    tmp.set_file_name(tmp_name);
+
+    fs::write(&tmp, body)
+        .await
+        .map_err(|e| StoreError::Backend(format!("write {tmp:?}: {e}")))?;
+    fs::rename(&tmp, path)
+        .await
+        .map_err(|e| StoreError::Backend(format!("rename {tmp:?} -> {path:?}: {e}")))?;
+    Ok(())
+}
+
+#[async_trait]
+impl ProjectionSink for FileProjection {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn commit(
+        &self,
+        stream: &StreamId,
+        _seq: Seq,
+        state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        let dir = self.stream_dir(stream)?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| StoreError::Backend(format!("mkdir {dir:?}: {e}")))?;
+        let target = dir.join("draft.md");
+        let body = (self.render)(state);
+        write_atomic(&target, &body).await
+    }
+
+    async fn on_label_set(
+        &self,
+        stream: &StreamId,
+        label: &Label,
+        _at: Seq,
+        state: &Value,
+    ) -> Result<(), StoreError> {
+        let label_slug = sanitize_component(label.as_str(), "label")?;
+        let dir = self.stream_dir(stream)?;
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| StoreError::Backend(format!("mkdir {dir:?}: {e}")))?;
+
+        let target = dir.join(format!("{label_slug}.md"));
+
+        // Archive any existing file for this label before overwriting.
+        if fs::try_exists(&target)
+            .await
+            .map_err(|e| StoreError::Backend(format!("exists {target:?}: {e}")))?
+        {
+            let archive_dir = dir.join("_archive");
+            fs::create_dir_all(&archive_dir)
+                .await
+                .map_err(|e| StoreError::Backend(format!("mkdir {archive_dir:?}: {e}")))?;
+            let now = Timestamp::now().0;
+            let archived = archive_dir.join(format!("{label_slug}.{now}.md"));
+            fs::rename(&target, &archived).await.map_err(|e| {
+                StoreError::Backend(format!("archive {target:?} -> {archived:?}: {e}"))
+            })?;
+        }
+
+        let body = (self.render)(state);
+        write_atomic(&target, &body).await
+    }
+}

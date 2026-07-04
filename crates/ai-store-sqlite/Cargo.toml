@@ -1,0 +1,24 @@
+[package]
+name = "ai-store-sqlite"
+description = "SQLite EventBackend and CacheBackend for the ai-store family (rusqlite via rusqlite-isle)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+ai-store-core = { path = "../ai-store-core", version = "0.1.0" }
+async-trait = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite-isle = { version = "0.1", features = ["tokio"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+json-patch = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

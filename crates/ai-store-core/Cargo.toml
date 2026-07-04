@@ -1,0 +1,20 @@
+[package]
+name = "ai-store-core"
+description = "Facade, SPI traits, and core types for the ai-store family (append-only event store with diff-based history)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+json-patch = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
