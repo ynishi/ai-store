@@ -9,13 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai-store-core::CheckpointBackend`: new SPI trait persisting
+  `ProjectionSink` checkpoints across process restarts, with
+  `Store::with_checkpoint_backend` as the opt-in constructor
+  (`Store::new` keeps the in-memory-only behavior). Implementations:
+  `ai-store-sqlite::SqliteCheckpointBackend` (new `sink_checkpoints`
+  table) and `ai-store-mem::MemCheckpointBackend`. Checkpoint advances
+  persist before the in-memory cache updates; backend read failures fail
+  open (worst case is a redundant redelivery, never a missed event).
+- `ai-store-sqlite`: `PRAGMA user_version`-tracked stepwise schema
+  migration runner replacing the one-shot `SCHEMA` constant. Each step
+  applies its DDL and bumps `user_version` in one transaction; databases
+  written by a newer `ai-store-sqlite` are refused at open. Pre-existing
+  unversioned databases are adopted idempotently.
+- `CatchUpReport.failures`: per-stream failure details
+  (`CatchUpFailure { stream, sink_id, message }`) recorded by `catch_up`
+  / `rebuild`.
+
 ### Changed
+
+- `Store::catch_up` / `Store::rebuild` no longer abort the whole call on
+  the first sink failure. A failing commit halts catch-up for that stream
+  only (order within a stream is preserved); every other stream is still
+  driven to completion. Remaining events on a failed stream are counted
+  in `CatchUpReport.skipped`, which was previously never incremented.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- Closed the gate-validate/append TOCTOU race: `append`, `import_event`
+  and `revert` now hold a per-stream write lock across the whole
+  state-read → gate-validate → backend-append → sink-dispatch critical
+  section, so concurrent writes to the same stream can no longer validate
+  against the same stale `current`. Writes to different streams remain
+  fully concurrent.
 
 ### Security
 
