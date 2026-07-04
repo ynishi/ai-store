@@ -10,10 +10,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-ai-store-core = { path = "../ai-store-core", version = "0.6.0" }
+ai-store-core = { path = "../ai-store-core", version = "0.7.0" }
 async-trait = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled"] }
-rusqlite-isle = { version = "0.3", features = ["tokio"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite-isle = { version = "0.4", features = ["tokio"] }
+libsqlite3-sys = { version = "0.35" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -7,7 +7,8 @@
 
 use ai_store_core::Patch;
 use ai_store_core::{
-    CacheBackend, Event, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp,
+    CacheBackend, Event, EventBackend, Label, NewEvent, Seq, SqliteBackend, StoreError, StreamId,
+    Timestamp,
 };
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
@@ -28,6 +29,14 @@ impl SqliteEventBackend {
     }
 }
 
+impl SqliteBackend for SqliteEventBackend {
+    type Handle = AsyncIsle;
+
+    fn new(handle: AsyncIsle) -> Self {
+        SqliteEventBackend::new(handle)
+    }
+}
+
 /// SQLite-backed `CacheBackend`. Cloneable; every clone shares the same
 /// SQLite thread.
 #[derive(Clone)]
@@ -39,6 +48,14 @@ impl SqliteCacheBackend {
     /// Build from an existing rusqlite-isle handle.
     pub fn new(isle: AsyncIsle) -> Self {
         Self { isle }
+    }
+}
+
+impl SqliteBackend for SqliteCacheBackend {
+    type Handle = AsyncIsle;
+
+    fn new(handle: AsyncIsle) -> Self {
+        SqliteCacheBackend::new(handle)
     }
 }
 

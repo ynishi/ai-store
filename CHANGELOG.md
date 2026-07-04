@@ -19,6 +19,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.7.0] - 2026-07-05
+
+### Added
+
+- `ai-store-core::SqliteBackend`: a new SPI trait generalizing the
+  `new(handle) -> Self` constructor pattern that `ai-store-sqlite`'s
+  `SqliteEventBackend` / `SqliteCacheBackend` already used. It is
+  implemented for both types via an associated `Handle` type, so
+  `ai-store-core` gains no infrastructure dependency of its own. Downstream
+  crates can write backend-construction code generic over "any backend
+  built from an existing native handle" without depending on
+  `ai-store-sqlite` directly. Existing inherent `new` constructors are
+  unchanged; the trait impl is purely additive.
+
+### Changed
+
+- `ai-store-sqlite`: bumped `rusqlite` 0.32 → 0.37 and `rusqlite-isle` 0.3 →
+  0.4 (bringing `libsqlite3-sys` up to 0.30 → 0.35). This returns to the
+  `rusqlite-isle` 0.4 band, the latest published `rusqlite-isle` release at
+  time of writing. `libsqlite3-sys` is now also pinned as an explicit
+  direct dependency (`0.35`) instead of being left to transitive
+  resolution, to make feature-unification conflicts with other
+  `libsqlite3-sys` consumers in a dependent's tree visible at `cargo
+  update` time rather than silently resolved. No backend-facing API
+  changes; `SqliteEventBackend` / `SqliteCacheBackend` behavior is
+  unchanged.
+- Downgrade ladder retrospective: v0.5.0 stepped down to the
+  `agent-block-core` band (`rusqlite` 0.31) so that crate could adopt
+  `ai-store` without a dependency-tree version conflict; v0.6.0 moved to
+  the `journal-mcp-core` band (`rusqlite` 0.32) for the same reason on that
+  crate's behalf; v0.7.0 (this release) returns to the latest
+  `rusqlite-isle` band (`rusqlite` 0.37), completing the 3-hop ladder. Each
+  hop's target dependent (`agent-block-core`, `journal-mcp-core`) adopted
+  `ai-store` at its corresponding band; this release does not require
+  either of those crates to move again.
+
 ## [0.6.0] - 2026-07-05
 
 ### Changed

@@ -7,6 +7,10 @@
 //!
 //! `CacheBackend` is a materialization cache for state snapshots. It is a
 //! derived artifact — pruning entries never violates the log's SoT property.
+//!
+//! `SqliteBackend` is a separate, narrower SPI: a generic constructor
+//! pattern for backends built from an existing native handle, so downstream
+//! crates can write handle-agnostic backend factories.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -170,4 +174,28 @@ pub trait CacheBackend: Send + Sync {
 
     /// Prune cached entries for a stream, keeping the `keep_latest` most recent.
     async fn prune(&self, stream: &StreamId, keep_latest: usize) -> Result<(), StoreError>;
+}
+
+/// SPI trait for backends built from an existing native storage handle
+/// (e.g. a connection, pool, or DB-specific async handle) rather than one
+/// that owns connection setup itself.
+///
+/// `ai-store-sqlite`'s `SqliteEventBackend` and `SqliteCacheBackend` both
+/// follow this shape today: each wraps a `rusqlite-isle` `AsyncIsle` handed
+/// in by the caller via an inherent `new(isle: AsyncIsle) -> Self`. This
+/// trait generalizes that constructor pattern so downstream crates can
+/// write code generic over "any backend built this way" without depending
+/// on `ai-store-sqlite` (or any other concrete backend crate) directly —
+/// the associated `Handle` type keeps `ai-store-core` free of any
+/// infrastructure dependency.
+///
+/// Implementing this trait is additive: existing inherent `new` methods on
+/// concrete backend types are unaffected and remain the primary
+/// construction path for direct callers.
+pub trait SqliteBackend: Sized {
+    /// The native storage handle type this backend wraps.
+    type Handle;
+
+    /// Build a backend instance from an existing handle.
+    fn new(handle: Self::Handle) -> Self;
 }

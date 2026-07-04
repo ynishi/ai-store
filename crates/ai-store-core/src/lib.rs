@@ -33,7 +33,7 @@ mod id;
 mod sink;
 mod state;
 
-pub use backend::{CacheBackend, EventBackend};
+pub use backend::{CacheBackend, EventBackend, SqliteBackend};
 pub use error::{SchemaViolation, StoreError};
 pub use event::{Event, NewEvent};
 pub use facade::{Store, StoreConfig, REVERT_KIND};
