@@ -134,6 +134,19 @@ impl BlockingStore {
             .block_on(self.inner.append(stream, kind, patch, meta))
     }
 
+    /// See [`Store::import_event`].
+    pub fn import_event(
+        &self,
+        stream: &StreamId,
+        kind: &str,
+        patch: Patch,
+        meta: Value,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
+        self.driver
+            .block_on(self.inner.import_event(stream, kind, patch, meta, at))
+    }
+
     /// See [`Store::state`].
     pub fn state(&self, stream: &StreamId) -> Result<Value, StoreError> {
         self.driver.block_on(self.inner.state(stream))

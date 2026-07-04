@@ -66,14 +66,21 @@ fn row_to_event(
     })
 }
 
-#[async_trait]
-impl EventBackend for SqliteEventBackend {
-    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+impl SqliteEventBackend {
+    /// Shared append path: assigns the next gap-free monotonic `Seq` in one
+    /// `BEGIN IMMEDIATE ... COMMIT` transaction and stamps the row with
+    /// `at_ms`. `append` passes the current wall-clock time; `import_event`
+    /// passes the caller-supplied historical timestamp.
+    async fn insert_event(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        at_ms: i64,
+    ) -> Result<Seq, StoreError> {
         let stream_name = stream.as_str().to_string();
         let patch_json = serde_json::to_string(&rec.patch).map_err(to_store_err)?;
         let meta_json = serde_json::to_string(&rec.meta).map_err(to_store_err)?;
         let kind = rec.kind;
-        let at_ms = Timestamp::now().0;
         self.isle
             .call(move |conn| {
                 let tx =
@@ -98,6 +105,22 @@ impl EventBackend for SqliteEventBackend {
             .await
             .map_err(to_store_err)
             .map(Seq)
+    }
+}
+
+#[async_trait]
+impl EventBackend for SqliteEventBackend {
+    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+        self.insert_event(stream, rec, Timestamp::now().0).await
+    }
+
+    async fn import_event(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
+        self.insert_event(stream, rec, at.0).await
     }
 
     async fn read(
@@ -244,8 +267,11 @@ impl EventBackend for SqliteEventBackend {
             .call(move |conn| {
                 // The index (stream, at_ms) lets SQLite pick the greatest
                 // matching row directly. `at_ms` is monotonic within a
-                // stream by construction (writer thread stamps append-time),
-                // so ORDER BY at_ms DESC + LIMIT 1 is well-defined.
+                // stream that only ever used `append` (writer thread stamps
+                // append-time), so ORDER BY at_ms DESC + LIMIT 1 is
+                // well-defined. Streams that mix in out-of-order
+                // `import_event` calls are not covered by that guarantee —
+                // see `Store::import_event`'s rustdoc.
                 conn.query_row(
                     "SELECT seq FROM events \
                      WHERE stream = ?1 AND at_ms <= ?2 \

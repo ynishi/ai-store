@@ -43,6 +43,15 @@ pub enum StoreError {
     /// Requested sink id is not registered on the store.
     #[error("unknown sink: {0}")]
     UnknownSink(String),
+
+    /// The backend does not support this operation.
+    ///
+    /// Returned by the default implementation of
+    /// [`crate::EventBackend::import_event`] when a backend has not opted in
+    /// to honoring a caller-supplied historical timestamp. The payload is a
+    /// short operation name (e.g. `"import_event"`).
+    #[error("backend does not support this operation: {0}")]
+    BackendUnsupported(String),
 }
 
 /// Rejection payload emitted by a `SchemaGate` implementation.

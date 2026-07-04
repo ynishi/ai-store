@@ -38,11 +38,16 @@ impl MemEventBackend {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-#[async_trait]
-impl EventBackend for MemEventBackend {
-    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+    /// Shared append path: assigns the next gap-free monotonic `Seq` and
+    /// stamps the event with `at`. `append` passes `Timestamp::now()`;
+    /// `import_event` passes the caller-supplied historical timestamp.
+    async fn push_event(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
         let mut inner = self.inner.lock().await;
         let state = inner.entry(stream.clone()).or_default();
         let seq = match state.head_seq() {
@@ -54,9 +59,25 @@ impl EventBackend for MemEventBackend {
             kind: rec.kind,
             patch: rec.patch,
             meta: rec.meta,
-            at: Timestamp::now(),
+            at,
         });
         Ok(seq)
+    }
+}
+
+#[async_trait]
+impl EventBackend for MemEventBackend {
+    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+        self.push_event(stream, rec, Timestamp::now()).await
+    }
+
+    async fn import_event(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
+        self.push_event(stream, rec, at).await
     }
 
     async fn read(
@@ -93,8 +114,10 @@ impl EventBackend for MemEventBackend {
         let Some(state) = inner.get(stream) else {
             return Ok(None);
         };
-        // Events are appended in monotonic Seq order and each event's Timestamp
-        // is taken at append time; we assume timestamps are non-decreasing.
+        // Assumes timestamps are non-decreasing in Seq order — true for every
+        // event written via `append` (stamped at write time). `import_event`
+        // callers are responsible for preserving that order themselves (see
+        // `Store::import_event`'s rustdoc); this scan does not verify it.
         // Find the greatest seq whose at <= given.
         Ok(state
             .events

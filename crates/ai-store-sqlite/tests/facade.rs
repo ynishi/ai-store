@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ai_store_core::{
-    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId,
+    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId, Timestamp,
 };
 use ai_store_sqlite::SqliteBackends;
 use async_trait::async_trait;
@@ -301,44 +301,209 @@ async fn read_by_meta_matches_json_null_via_json_type() {
 }
 
 /// Smoke-test the migration recipe encoded in
-/// `examples/migrate_from_json.rs`: chain-checked import from `(before,
-/// after)` snapshots reconstructs `Store::state` exactly.
+/// `examples/migrate_from_json.rs`: chain-checked import via
+/// `Store::import_event` from `(before, after)` snapshots reconstructs
+/// `Store::state` exactly, and `seq_at_time` answers against the imported
+/// (source-system) timestamps rather than wall-clock import time.
 #[tokio::test]
 async fn migrate_from_json_recipe_reconstructs_final_state() {
     let be = SqliteBackends::open_in_memory().await.unwrap();
     let store = open_facade(&be).await;
     let s = StreamId::new("doc/legacy");
 
-    let legacy: Vec<(&str, Value, Value)> = vec![
-        ("create", Value::Null, json!({ "title": "draft", "n": 0 })),
+    let legacy: Vec<(&str, i64, Value, Value)> = vec![
+        (
+            "create",
+            1_700_000_000_000,
+            Value::Null,
+            json!({ "title": "draft", "n": 0 }),
+        ),
         (
             "rename",
+            1_700_000_060_000,
             json!({ "title": "draft", "n": 0 }),
             json!({ "title": "final", "n": 0 }),
         ),
         (
             "bump",
+            1_700_000_120_000,
             json!({ "title": "final", "n": 0 }),
             json!({ "title": "final", "n": 3 }),
         ),
     ];
 
     let mut prev = Value::Null;
-    for (i, (kind, before, after)) in legacy.iter().enumerate() {
+    for (i, (kind, at_ms, before, after)) in legacy.iter().enumerate() {
         assert_eq!(before, &prev, "chain broken at index {i}");
         let p: Patch = json_patch::diff(before, after);
         store
-            .append(&s, kind, p, json!({ "legacy_index": i }))
+            .import_event(&s, kind, p, json!({ "legacy_index": i }), Timestamp(*at_ms))
             .await
             .unwrap();
         prev = after.clone();
     }
 
-    let expected = legacy.last().unwrap().2.clone();
+    let expected = legacy.last().unwrap().3.clone();
     assert_eq!(store.state(&s).await.unwrap(), expected);
     assert_eq!(
         store.head(&s).await.unwrap(),
         Some(Seq(legacy.len() as u64))
+    );
+
+    // `seq_at_time` answers against the source system's timeline, since
+    // every event's `at` was imported verbatim rather than stamped at
+    // migration time (mirrors Assertion 4 in the example).
+    let at_second_entry = Timestamp(legacy[1].1);
+    assert_eq!(
+        store.seq_at_time(&s, at_second_entry).await.unwrap(),
+        Some(Seq(2))
+    );
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- import_event ---------------------------------------------------------
+
+#[tokio::test]
+async fn import_event_preserves_caller_supplied_timestamp() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+    let at = Timestamp(1_700_000_000_000);
+
+    let seq = store
+        .import_event(
+            &s,
+            "legacy_create",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+            at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(1));
+
+    let events = store.read(&s, Seq(1), 1).await.unwrap();
+    assert_eq!(events[0].at, at);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_event_into_empty_stream_supports_historical_seq_at_time() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .import_event(
+            &s,
+            "create",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+    store
+        .import_event(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 1 }])),
+            json!({}),
+            Timestamp(1_700_000_060_000),
+        )
+        .await
+        .unwrap();
+
+    let seq = store
+        .seq_at_time(&s, Timestamp(1_700_000_030_000))
+        .await
+        .unwrap();
+    assert_eq!(seq, Some(Seq(1)));
+
+    let seq2 = store
+        .seq_at_time(&s, Timestamp(1_700_000_060_000))
+        .await
+        .unwrap();
+    assert_eq!(seq2, Some(Seq(2)));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_event_is_rejected_by_gates_same_as_append() {
+    use ai_store_core::{GateCtx, SchemaGate, SchemaViolation};
+
+    struct RejectKind {
+        forbidden: &'static str,
+    }
+
+    impl SchemaGate for RejectKind {
+        fn validate(&self, ctx: &GateCtx<'_>) -> Result<(), SchemaViolation> {
+            if ctx.kind == self.forbidden {
+                Err(SchemaViolation::new(
+                    "forbidden_kind",
+                    format!("kind '{}' is not permitted", self.forbidden),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = Store::new(
+        Arc::new(be.events.clone()),
+        Arc::new(be.cache.clone()),
+        vec![Arc::new(RejectKind {
+            forbidden: "denied",
+        })],
+        Vec::new(),
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc");
+
+    let err = store
+        .import_event(
+            &s,
+            "denied",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Schema(_)));
+    assert_eq!(store.head(&s).await.unwrap(), None);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_event_dispatches_to_sinks_same_as_append() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = open_facade_with_sinks(&be, vec![sink.clone()]).await;
+    let s = StreamId::new("doc");
+
+    store
+        .import_event(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1)]
     );
 
     be.driver.shutdown().await.unwrap();

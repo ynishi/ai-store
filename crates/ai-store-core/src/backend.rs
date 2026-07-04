@@ -27,6 +27,33 @@ pub trait EventBackend: Send + Sync {
     /// Returns the assigned `Seq` on success.
     async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError>;
 
+    /// Import one event, stamping it with a caller-supplied historical
+    /// `Timestamp` instead of the wall-clock time of the call.
+    ///
+    /// This is the import/migration counterpart to [`EventBackend::append`]:
+    /// the backend still assigns the next gap-free monotonic `Seq` exactly as
+    /// `append` would, but records `at` as the event's time coordinate rather
+    /// than stamping "now". See [`crate::Store::import_event`] for the full
+    /// contract, including the caveat about non-monotonic `at` and
+    /// [`crate::Store::seq_at_time`].
+    ///
+    /// The default implementation returns
+    /// [`StoreError::BackendUnsupported`] so that existing external
+    /// `EventBackend` implementations keep compiling — and keep behaving
+    /// exactly as before this method was added — without being forced to
+    /// fake support for historical timestamps they cannot actually honor.
+    /// Backends that can persist an arbitrary `at` (both backends shipped in
+    /// this workspace do) should override it.
+    async fn import_event(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
+        let _ = (stream, rec, at);
+        Err(StoreError::BackendUnsupported("import_event".to_string()))
+    }
+
     /// Read events in `[from, from + limit)` order.
     ///
     /// If `from` is greater than the head, returns an empty vector.

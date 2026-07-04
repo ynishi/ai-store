@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ai_store_core::{
-    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId,
+    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId, Timestamp,
 };
 use ai_store_mem::{MemCacheBackend, MemEventBackend};
 use ai_store_sync::BlockingStore;
@@ -113,6 +113,30 @@ fn owned_runtime_revert_appends_event() {
     assert_eq!(seq_reverted, Seq(3));
     assert_eq!(bs.state(&s).unwrap(), json!({ "n": 0 }));
     assert_eq!(bs.head(&s).unwrap(), Some(Seq(3)));
+}
+
+/// `BlockingStore::import_event` mirrors `Store::import_event`: the backend
+/// records the caller-supplied historical `Timestamp` verbatim rather than
+/// stamping wall-clock time.
+#[test]
+fn import_event_preserves_caller_supplied_timestamp_via_blocking_facade() {
+    let bs = BlockingStore::new(build_store()).expect("runtime");
+    let s = StreamId::new("doc");
+    let at = Timestamp(1_700_000_000_000);
+
+    let seq = bs
+        .import_event(
+            &s,
+            "legacy_create",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+            at,
+        )
+        .unwrap();
+    assert_eq!(seq, Seq(1));
+
+    let events = bs.read(&s, Seq(1), 1).unwrap();
+    assert_eq!(events[0].at, at);
 }
 
 /// `Clone` shares the same runtime + inner store: writes on one handle are

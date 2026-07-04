@@ -438,6 +438,135 @@ async fn seq_at_time_composes_with_state_at_for_wall_clock_restore() {
     assert_eq!(store.seq_at_time(&s, Timestamp(0)).await.unwrap(), None);
 }
 
+// ---- import_event ---------------------------------------------------------
+
+#[tokio::test]
+async fn import_event_preserves_caller_supplied_timestamp() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+    let at = Timestamp(1_700_000_000_000);
+
+    let seq = store
+        .import_event(
+            &s,
+            "legacy_create",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+            at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(1));
+
+    let events = store.read(&s, Seq(1), 1).await.unwrap();
+    assert_eq!(events[0].at, at);
+}
+
+#[tokio::test]
+async fn import_event_into_empty_stream_supports_historical_seq_at_time() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    store
+        .import_event(
+            &s,
+            "create",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+    store
+        .import_event(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 1 }])),
+            json!({}),
+            Timestamp(1_700_000_060_000),
+        )
+        .await
+        .unwrap();
+
+    // Between the two historical timestamps resolves to the first import.
+    let seq = store
+        .seq_at_time(&s, Timestamp(1_700_000_030_000))
+        .await
+        .unwrap();
+    assert_eq!(seq, Some(Seq(1)));
+
+    // At or after the second timestamp resolves to the second import.
+    let seq2 = store
+        .seq_at_time(&s, Timestamp(1_700_000_060_000))
+        .await
+        .unwrap();
+    assert_eq!(seq2, Some(Seq(2)));
+}
+
+#[tokio::test]
+async fn import_event_is_rejected_by_gates_same_as_append() {
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(MemCacheBackend::new());
+    let gate: Arc<dyn SchemaGate> = Arc::new(RejectKind {
+        forbidden: "denied",
+    });
+    let store = Store::new(
+        events.clone(),
+        cache,
+        vec![gate],
+        Vec::new(),
+        StoreConfig::default(),
+    );
+
+    let s = StreamId::new("doc");
+    let err = store
+        .import_event(
+            &s,
+            "denied",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Schema(_)));
+
+    // The rejected write never reached the backend.
+    assert_eq!(events.head(&s).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn import_event_dispatches_to_sinks_same_as_append() {
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    let s = StreamId::new("doc");
+    store
+        .import_event(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+            Timestamp(1_700_000_000_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1)]
+    );
+}
+
 // ---- labels + facade wrapping ------------------------------------------
 
 #[tokio::test]

@@ -378,6 +378,48 @@ async fn label_delete_of_unknown_label_reports_not_found() {
 }
 
 #[tokio::test]
+async fn import_event_assigns_next_seq_and_preserves_supplied_timestamp() {
+    let be = fresh().await;
+    let s = StreamId::new("s");
+
+    be.events
+        .append(&s, new_event("k1", empty_patch()))
+        .await
+        .unwrap();
+
+    let at = Timestamp(1_700_000_000_000);
+    let seq = be
+        .events
+        .import_event(&s, new_event("k2", empty_patch()), at)
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(2));
+    assert_eq!(be.events.head(&s).await.unwrap(), Some(Seq(2)));
+
+    let events = be.events.read(&s, Seq(2), 1).await.unwrap();
+    assert_eq!(events[0].at, at);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_event_on_empty_stream_starts_at_seq_one() {
+    let be = fresh().await;
+    let s = StreamId::new("s");
+    let at = Timestamp(1_700_000_000_000);
+
+    let seq = be
+        .events
+        .import_event(&s, new_event("k1", empty_patch()), at)
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(1));
+    assert_eq!(be.events.head(&s).await.unwrap(), Some(Seq(1)));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_patch_round_trips_through_append_and_read() {
     let be = fresh().await;
     let s = StreamId::new("s");

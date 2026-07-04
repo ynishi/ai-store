@@ -316,6 +316,39 @@ async fn label_delete_on_unknown_stream_reports_not_found() {
 }
 
 #[tokio::test]
+async fn import_event_assigns_next_seq_and_preserves_supplied_timestamp() {
+    let be = MemEventBackend::new();
+    let s = StreamId::new("s");
+
+    be.append(&s, new_event("k1", empty_patch())).await.unwrap();
+
+    let at = Timestamp(1_700_000_000_000);
+    let seq = be
+        .import_event(&s, new_event("k2", empty_patch()), at)
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(2));
+    assert_eq!(be.head(&s).await.unwrap(), Some(Seq(2)));
+
+    let events = be.read(&s, Seq(2), 1).await.unwrap();
+    assert_eq!(events[0].at, at);
+}
+
+#[tokio::test]
+async fn import_event_on_empty_stream_starts_at_seq_one() {
+    let be = MemEventBackend::new();
+    let s = StreamId::new("s");
+    let at = Timestamp(1_700_000_000_000);
+
+    let seq = be
+        .import_event(&s, new_event("k1", empty_patch()), at)
+        .await
+        .unwrap();
+    assert_eq!(seq, Seq(1));
+    assert_eq!(be.head(&s).await.unwrap(), Some(Seq(1)));
+}
+
+#[tokio::test]
 async fn event_patch_round_trips_through_append_and_read() {
     let be = MemEventBackend::new();
     let s = StreamId::new("s");

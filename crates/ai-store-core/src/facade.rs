@@ -134,6 +134,10 @@ impl Store {
 
     /// Append one event to `stream`. Returns the assigned `Seq`.
     ///
+    /// The backend stamps `at` with the wall-clock time of this call — use
+    /// this for ordinary domain writes. See [`Store::import_event`] for the
+    /// historical-timestamp counterpart used by import/migration paths.
+    ///
     /// Fast path: when no [`SchemaGate`] is registered, `next` is not
     /// materialized pre-commit. If the assigned `seq` misses the cache stride
     /// and no [`ProjectionSink`] is registered, `next` is not materialized at
@@ -144,6 +148,84 @@ impl Store {
         kind: &str,
         patch: json_patch::Patch,
         meta: Value,
+    ) -> Result<Seq, StoreError> {
+        self.write_event(stream, kind, patch, meta, None).await
+    }
+
+    /// Import one event into `stream`, recording `at` as its time coordinate
+    /// instead of the wall-clock time of this call.
+    ///
+    /// Identical to [`Store::append`] in every other respect — the same
+    /// gates validate the write, the same sinks are dispatched, the same
+    /// cache-stride rule decides whether `next` is materialized. The only
+    /// difference is which [`EventBackend`] method is invoked: `append`
+    /// delegates to [`EventBackend::append`] (backend stamps "now"),
+    /// `import_event` delegates to [`EventBackend::import_event`] (backend
+    /// stamps the supplied `at`). This is the escape hatch for backfilling
+    /// history that already has its own notion of "when" — an import from a
+    /// legacy system, for example — without discarding that timeline.
+    ///
+    /// Use `append` for ordinary domain writes; reach for `import_event` only
+    /// on import/migration paths.
+    ///
+    /// ## `at` is a time coordinate, not an ordering key
+    ///
+    /// Every event carries a time coordinate (`at`) and a log position
+    /// (`seq`). `append` always sets `at` to the wall-clock moment of the
+    /// write; `import_event` lets the caller substitute a different
+    /// coordinate — typically the moment the change happened in the source
+    /// system being migrated in. Either way, **`seq` orders the log; `at`
+    /// never does.**
+    ///
+    /// ## Non-monotonic `at` and [`Store::seq_at_time`]
+    ///
+    /// [`Store::seq_at_time`] answers "the greatest `seq` whose `at` is `<=`
+    /// the given timestamp", which only matches intuition when a stream's
+    /// `at` values are non-decreasing in `seq` order — true automatically for
+    /// a stream written entirely via `append` (wall-clock time only moves
+    /// forward). `import_event` does not enforce that invariant: the
+    /// supplied `at` may be less than, equal to, or greater than the
+    /// timestamp already recorded at the stream's head.
+    ///
+    /// Backfilling into an **empty** stream in chronological source order —
+    /// the typical migration shape — keeps the non-decreasing assumption
+    /// intact by construction, so `seq_at_time` behaves exactly as it would
+    /// for an `append`-only stream. Importing out of order, or mixing
+    /// `import_event` into a stream that already has `append`ed events on a
+    /// different clock, can leave `seq_at_time` answering a query in a way
+    /// that does not match intuition for that stream (backends are not
+    /// required to detect or reject this). Callers who need that guarantee
+    /// should read the current head event (`Store::head` + `Store::read`)
+    /// and compare its `at` before importing.
+    ///
+    /// Returns [`StoreError::BackendUnsupported`] if the underlying
+    /// [`EventBackend`] has not overridden [`EventBackend::import_event`]
+    /// (the default implementation declines).
+    pub async fn import_event(
+        &self,
+        stream: &StreamId,
+        kind: &str,
+        patch: json_patch::Patch,
+        meta: Value,
+        at: Timestamp,
+    ) -> Result<Seq, StoreError> {
+        self.write_event(stream, kind, patch, meta, Some(at)).await
+    }
+
+    /// Shared write path for [`Store::append`] and [`Store::import_event`].
+    ///
+    /// `at = None` delegates to [`EventBackend::append`] (backend stamps
+    /// "now"); `at = Some(_)` delegates to [`EventBackend::import_event`]
+    /// (backend stamps the supplied timestamp). Every other step — gate
+    /// validation, `next` materialization, cache write, sink dispatch — is
+    /// identical between the two callers.
+    async fn write_event(
+        &self,
+        stream: &StreamId,
+        kind: &str,
+        patch: json_patch::Patch,
+        meta: Value,
+        at: Option<Timestamp>,
     ) -> Result<Seq, StoreError> {
         let current = self.state(stream).await?;
         let has_gates = !self.gates.is_empty();
@@ -184,7 +266,10 @@ impl Store {
             patch,
             meta,
         };
-        let seq = self.events.append(stream, rec).await?;
+        let seq = match at {
+            Some(at) => self.events.import_event(stream, rec, at).await?,
+            None => self.events.append(stream, rec).await?,
+        };
 
         let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
         let needs_next = cache_hit || !self.sinks.is_empty();

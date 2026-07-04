@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Store::import_event(stream, kind, patch, meta, at: Timestamp)`: import one
+  event with a caller-supplied historical timestamp instead of the
+  wall-clock time of the call, for backfilling history from a system that
+  already has its own notion of "when" (closes #8). `EventBackend` gains a
+  matching `import_event` method with a default implementation returning
+  `StoreError::BackendUnsupported` — existing external backend
+  implementations keep compiling and behave exactly as before; `ai-store-mem`
+  and `ai-store-sqlite` both override it. `BlockingStore::import_event`
+  mirrors the async facade. `examples/migrate_from_json.rs` (ai-store-sqlite)
+  now preserves the legacy log's original timestamps via `import_event`
+  instead of stashing them in `meta`.
+
 ### Changed
 
 ### Deprecated

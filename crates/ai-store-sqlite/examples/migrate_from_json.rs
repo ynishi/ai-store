@@ -12,19 +12,21 @@
 //! into a `Store`-backed stream is mechanical, but four questions come up
 //! every time. This example answers them in one place.
 //!
-//! ## 1. Timestamps: use "now" or the legacy `at_ms`?
+//! ## 1. Timestamps: preserve the source system's clock via `import_event`
 //!
-//! `EventBackend::append` stamps its own timestamp (the moment of import).
-//! There is deliberately no SPI method that lets a caller override the
-//! backend-stamped `at_ms` — allowing arbitrary timestamps would break the
-//! monotonicity assumption `seq_at_time` relies on.
+//! `Store::import_event` is the import/migration counterpart to
+//! `Store::append`: it takes an explicit `Timestamp` and the backend records
+//! it as the event's time coordinate instead of stamping the wall-clock time
+//! of the call. Using it here means `Store::seq_at_time` answers *"when did
+//! the change happen in the source system"*, not *"when did we run this
+//! migration"*.
 //!
-//! Consequence: `Store::seq_at_time` answers *"when was this event
-//! imported"*, not *"when did the change happen in the source system"*.
-//!
-//! Recipe: carry the legacy timestamp inside `meta` (see `legacy_at_ms`
-//! below). Wall-clock queries against the source system's timeline then
-//! become `read_by_meta` (equality) or `read` + client-side filter (range).
+//! `at` is a time coordinate, not the log's ordering key — `seq` orders the
+//! log, `at` never does. Backfilling into an *empty* stream in chronological
+//! order (the shape this example follows) keeps `seq_at_time`'s
+//! non-decreasing-`at` assumption intact automatically. See
+//! `Store::import_event`'s rustdoc for the caveat that applies to
+//! non-chronological imports.
 //!
 //! ## 2. Event `kind`: uniform or per-action?
 //!
@@ -60,7 +62,7 @@
 
 use std::sync::Arc;
 
-use ai_store_core::{Patch, Seq, Store, StoreConfig, StreamId};
+use ai_store_core::{Patch, Seq, Store, StoreConfig, StreamId, Timestamp};
 use ai_store_sqlite::SqliteBackends;
 use json_patch::diff;
 use serde::{Deserialize, Serialize};
@@ -94,11 +96,10 @@ async fn migrate(
         }
 
         let patch: Patch = diff(&entry.before, &entry.after);
-        let meta = json!({
-            "legacy_at_ms": entry.at_ms,
-            "legacy_index": i,
-        });
-        store.append(stream, &entry.kind, patch, meta).await?;
+        let meta = json!({ "legacy_index": i });
+        store
+            .import_event(stream, &entry.kind, patch, meta, Timestamp(entry.at_ms))
+            .await?;
 
         prev_after = entry.after.clone();
     }
@@ -160,22 +161,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mid = store.state_at(&stream, Seq(2)).await?;
     assert_eq!(mid, legacy[1].after);
 
-    // Demo: retrieve the imported event that carried a specific
-    // `legacy_at_ms` — exercises `read_by_meta` (Issue #2) on the same
-    // metadata carried during migration.
+    // Assertion 4: `seq_at_time` answers against the *source system's*
+    // timeline, since every event's `at` was imported verbatim rather than
+    // stamped at migration time (Issue #8).
+    let at_second_entry = Timestamp(legacy[1].at_ms);
+    let seq_at_second = store.seq_at_time(&stream, at_second_entry).await?;
+    assert_eq!(seq_at_second, Some(Seq(2)));
+    println!(
+        "seq_at_time({}) → {:?} (source-system timeline, not import time)",
+        legacy[1].at_ms, seq_at_second
+    );
+
+    // Demo: retrieve the imported event by its position in the legacy log —
+    // exercises `read_by_meta` (Issue #2) on the `legacy_index` metadata
+    // carried during migration.
     let hits = store
-        .read_by_meta(
-            &stream,
-            "legacy_at_ms",
-            &json!(1_700_000_060_000_i64),
-            Seq(1),
-            10,
-        )
+        .read_by_meta(&stream, "legacy_index", &json!(1), Seq(1), 10)
         .await?;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].kind, "update_title");
     println!(
-        "read_by_meta(legacy_at_ms=1700000060000) → seq {:?}, kind={}",
+        "read_by_meta(legacy_index=1) → seq {:?}, kind={}",
         hits[0].seq, hits[0].kind
     );
 
