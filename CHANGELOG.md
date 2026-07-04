@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.5.0] - 2026-07-05
+
+### Changed
+
+- `ai-store-sqlite`: downgraded `rusqlite` 0.37 → 0.31 and `rusqlite-isle`
+  0.1 → 0.2 (bringing `libsqlite3-sys` down to 0.35 → 0.28). This is a
+  deliberate downgrade release: it puts `ai-store` on the same
+  `rusqlite`/`libsqlite3-sys` band as `agent-block-core`, so that project can
+  adopt `ai-store` without a dependency-tree version conflict. No
+  backend-facing API changes; `SqliteEventBackend` / `SqliteCacheBackend`
+  behavior is unchanged.
+- Planned follow-up: v0.6.0 moves to `rusqlite-isle` 0.3 (`rusqlite` 0.32,
+  `journal-mcp-core` band), then v0.7.0 returns to the `rusqlite-isle` 0.4
+  (`rusqlite` 0.37) band this release stepped down from.
+
 ## [0.4.0] - 2026-07-04
 
 ### Added
