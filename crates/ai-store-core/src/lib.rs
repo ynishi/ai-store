@@ -23,11 +23,6 @@
 //! 4. **Single write channel.** Every write flows through `Store::append`, which
 //!    invokes `SchemaGate::validate` before delegating to the backend in a single
 //!    transaction. There is no raw-append escape hatch on the public API.
-//!
-//! ## Design source
-//!
-//! See the project design draft at `workspace/tasks/ai-store-design/draft.md`
-//! (private) for the full C1–C4 decision record.
 
 mod backend;
 mod error;
