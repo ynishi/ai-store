@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.0] - 2026-07-04
+
+### Added
+
 - `Store::import_event(stream, kind, patch, meta, at: Timestamp)`: import one
   event with a caller-supplied historical timestamp instead of the
   wall-clock time of the call, for backfilling history from a system that
@@ -20,16 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirrors the async facade. `examples/migrate_from_json.rs` (ai-store-sqlite)
   now preserves the legacy log's original timestamps via `import_event`
   instead of stashing them in `meta`.
-
-### Changed
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
 
 ## [0.3.0] - 2026-07-04
 
