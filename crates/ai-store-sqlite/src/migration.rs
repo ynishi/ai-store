@@ -1,0 +1,193 @@
+//! `PRAGMA user_version`-based stepwise schema migration runner.
+//!
+//! `MIGRATIONS[i]` is the SQL statement batch that steps the database from
+//! `user_version = i` to `user_version = i + 1`. [`apply`] runs every
+//! outstanding step in its own transaction (schema change + `user_version`
+//! bump commit together, so a crash mid-migration can never leave
+//! `user_version` ahead of the schema it actually applied) and rejects
+//! databases whose `user_version` is newer than this build understands
+//! (opening a database written by a newer `ai-store-sqlite` with an older
+//! one).
+//!
+//! PRAGMAs that cannot run inside a transaction (`journal_mode`,
+//! `synchronous`, `foreign_keys`) are deliberately **not** part of any
+//! migration step — the caller applies them separately, in autocommit mode,
+//! before calling [`apply`]. See `driver::init_conn`.
+
+use ai_store_core::StoreError;
+use rusqlite::Connection;
+
+/// Ordered migration steps. `MIGRATIONS[i]` moves the schema from
+/// `user_version = i` to `user_version = i + 1`.
+pub(crate) const MIGRATIONS: &[&str] = &[
+    // Migration 1 (index 0): baseline schema — events, labels, cache.
+    //
+    // Uses `CREATE TABLE IF NOT EXISTS` so it stays idempotent against
+    // databases created before schema versioning existed: a pre-existing
+    // database file has `user_version = 0` by SQLite default, and may
+    // already contain these exact tables from the original one-shot
+    // `SCHEMA` constant this migration runner replaced.
+    r#"
+        CREATE TABLE IF NOT EXISTS events (
+            stream TEXT NOT NULL,
+            seq    INTEGER NOT NULL,
+            kind   TEXT NOT NULL,
+            patch  TEXT NOT NULL,
+            meta   TEXT NOT NULL,
+            at_ms  INTEGER NOT NULL,
+            PRIMARY KEY (stream, seq)
+        );
+        CREATE INDEX IF NOT EXISTS ix_events_stream_at ON events(stream, at_ms);
+
+        CREATE TABLE IF NOT EXISTS labels (
+            stream TEXT NOT NULL,
+            name   TEXT NOT NULL,
+            at_seq INTEGER NOT NULL,
+            PRIMARY KEY (stream, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS cache (
+            stream TEXT NOT NULL,
+            at_seq INTEGER NOT NULL,
+            state  TEXT NOT NULL,
+            PRIMARY KEY (stream, at_seq)
+        );
+    "#,
+    // Migration 2 (index 1): sink checkpoint persistence.
+    //
+    // Backs `SqliteCheckpointBackend` (see `crate::backend`), which lets
+    // `ai_store_core::Store::with_checkpoint_backend` survive sink
+    // checkpoints across process restarts.
+    r#"
+        CREATE TABLE IF NOT EXISTS sink_checkpoints (
+            sink_id TEXT NOT NULL,
+            stream  TEXT NOT NULL,
+            at_seq  INTEGER NOT NULL,
+            PRIMARY KEY (sink_id, stream)
+        );
+    "#,
+];
+
+/// Apply every outstanding migration to `conn`, tracked via
+/// `PRAGMA user_version`.
+///
+/// Idempotent: calling this on an already-migrated connection is a no-op
+/// (the loop below starts at the connection's current `user_version` and
+/// `MIGRATIONS.iter().skip(current)` is empty once `current == MIGRATIONS.len()`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Backend`] if:
+/// - reading or bumping `PRAGMA user_version` fails,
+/// - a migration step's SQL fails to apply, or
+/// - `conn`'s `user_version` is already greater than `MIGRATIONS.len()` —
+///   this build of `ai-store-sqlite` does not know how to open a database
+///   written by a newer version.
+pub(crate) fn apply(conn: &mut Connection) -> Result<(), StoreError> {
+    let current: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| StoreError::Backend(format!("read user_version: {e}")))?;
+    let current = current as usize;
+    let total = MIGRATIONS.len();
+
+    if current > total {
+        return Err(StoreError::Backend(format!(
+            "database schema version {current} is newer than this build of \
+             ai-store-sqlite supports ({total} known migrations); refusing to open"
+        )));
+    }
+
+    for (i, step) in MIGRATIONS.iter().enumerate().skip(current) {
+        let step_num = i + 1;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Backend(format!("begin migration {step_num}: {e}")))?;
+        tx.execute_batch(step)
+            .map_err(|e| StoreError::Backend(format!("apply migration {step_num}: {e}")))?;
+        // `user_version` is a validated array index (`step_num <=
+        // MIGRATIONS.len()`), never caller-controlled input, so a bound
+        // parameter isn't needed here — `PRAGMA user_version = N` doesn't
+        // accept one anyway.
+        tx.pragma_update(None, "user_version", step_num as i64)
+            .map_err(|e| StoreError::Backend(format!("bump user_version to {step_num}: {e}")))?;
+        tx.commit()
+            .map_err(|e| StoreError::Backend(format!("commit migration {step_num}: {e}")))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_database_reaches_the_latest_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn applying_twice_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        apply(&mut conn).unwrap();
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+
+        // Re-applying did not error on (or duplicate) the already-created
+        // baseline table.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn preexisting_unversioned_tables_are_adopted_idempotently() {
+        // Simulates a database created before schema versioning existed:
+        // `user_version` defaults to 0, but the baseline tables already
+        // exist (created by the original one-shot `SCHEMA` constant).
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        assert_eq!(user_version(&conn), 0);
+
+        apply(&mut conn).unwrap();
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sink_checkpoints'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        conn.pragma_update(None, "user_version", (MIGRATIONS.len() as i64) + 1)
+            .unwrap();
+
+        let err = apply(&mut conn).unwrap_err();
+        match err {
+            StoreError::Backend(msg) => assert!(
+                msg.contains("newer"),
+                "expected a 'newer than supported' message, got: {msg}"
+            ),
+            other => panic!("expected StoreError::Backend, got {other:?}"),
+        }
+    }
+}

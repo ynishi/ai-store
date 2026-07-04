@@ -1,58 +1,59 @@
 //! Backend construction and lifecycle owner.
 //!
 //! `SqliteBackends::open` / `open_in_memory` spawn one rusqlite-isle actor,
-//! apply the schema, and hand back a `SqliteBackends` triple: the event
-//! backend, the cache backend, and the driver whose `shutdown` joins the
-//! SQLite thread cleanly.
+//! apply the mandatory startup PRAGMAs plus every outstanding schema
+//! migration (see `crate::migration`), and hand back a `SqliteBackends`
+//! quadruple: the event backend, the cache backend, the checkpoint backend,
+//! and the driver whose `shutdown` joins the SQLite thread cleanly.
 
 use std::path::Path;
 
 use ai_store_core::StoreError;
+use rusqlite::Connection;
 use rusqlite_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
 
-use crate::backend::{SqliteCacheBackend, SqliteEventBackend};
+use crate::backend::{SqliteCacheBackend, SqliteCheckpointBackend, SqliteEventBackend};
+use crate::migration;
 
-const SCHEMA: &str = r#"
+/// Startup PRAGMAs. Deliberately kept out of `migration::MIGRATIONS`:
+/// `journal_mode` in particular cannot be changed inside a transaction, and
+/// all three are connection-scoped settings rather than schema state, so
+/// they are re-applied on every open (autocommit, ahead of migrations)
+/// instead of being tracked by `PRAGMA user_version`.
+const STARTUP_PRAGMAS: &str = r#"
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous  = NORMAL;
     PRAGMA foreign_keys = ON;
-
-    CREATE TABLE IF NOT EXISTS events (
-        stream TEXT NOT NULL,
-        seq    INTEGER NOT NULL,
-        kind   TEXT NOT NULL,
-        patch  TEXT NOT NULL,
-        meta   TEXT NOT NULL,
-        at_ms  INTEGER NOT NULL,
-        PRIMARY KEY (stream, seq)
-    );
-    CREATE INDEX IF NOT EXISTS ix_events_stream_at ON events(stream, at_ms);
-
-    CREATE TABLE IF NOT EXISTS labels (
-        stream TEXT NOT NULL,
-        name   TEXT NOT NULL,
-        at_seq INTEGER NOT NULL,
-        PRIMARY KEY (stream, name)
-    );
-
-    CREATE TABLE IF NOT EXISTS cache (
-        stream TEXT NOT NULL,
-        at_seq INTEGER NOT NULL,
-        state  TEXT NOT NULL,
-        PRIMARY KEY (stream, at_seq)
-    );
 "#;
 
-/// Bundle of the two SPI backends plus their shared lifecycle owner.
+/// `init` closure passed to `AsyncIsle::spawn` / `open_in_memory`: applies
+/// startup PRAGMAs, then runs the versioned migration chain. Runs once per
+/// connection, before any application job is enqueued.
+fn init_conn(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(STARTUP_PRAGMAS)?;
+    migration::apply(conn).map_err(|e| {
+        // `migration::apply` reports failures as `StoreError`, but the
+        // `init` closure signature (fixed by `rusqlite_isle::AsyncIsle`) is
+        // `rusqlite::Result<()>`. `ToSqlConversionFailure` is reused here
+        // purely as a generic "boxed error" carrier — the actual failure is
+        // a migration error, not a `ToSql` conversion — so the message is
+        // preserved verbatim rather than the variant name being meaningful.
+        rusqlite::Error::ToSqlConversionFailure(e.to_string().into())
+    })
+}
+
+/// Bundle of the three SPI backends plus their shared lifecycle owner.
 ///
-/// The event and cache backend share a single SQLite thread (one connection,
-/// one writer) so append + cache put stay serialized on the same actor and
-/// never contend on separate locks.
+/// The event, cache, and checkpoint backends share a single SQLite thread
+/// (one connection, one writer) so append + cache put + checkpoint put stay
+/// serialized on the same actor and never contend on separate locks.
 pub struct SqliteBackends {
     /// The append-only event log backend.
     pub events: SqliteEventBackend,
     /// The materialization cache backend.
     pub cache: SqliteCacheBackend,
+    /// The sink checkpoint backend (see [`ai_store_core::CheckpointBackend`]).
+    pub checkpoints: SqliteCheckpointBackend,
     /// Lifecycle owner. Call `shutdown` when done to drain and join.
     pub driver: SqliteBackendDriver,
 }
@@ -79,21 +80,20 @@ impl SqliteBackendDriver {
 }
 
 impl SqliteBackends {
-    /// Open a database file, apply the ai-store schema, and return the
-    /// backend triple.
+    /// Open a database file, apply startup PRAGMAs plus every outstanding
+    /// schema migration (see `crate::migration`), and return the backend
+    /// quadruple.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let (isle, driver) = AsyncIsle::spawn(path.as_ref().to_path_buf(), |conn| {
-            conn.execute_batch(SCHEMA)
-        })
-        .await
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let (isle, driver) = AsyncIsle::spawn(path.as_ref().to_path_buf(), init_conn)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(Self::from_isle(isle, driver))
     }
 
     /// Open an in-memory database (useful for tests). The database is
     /// discarded when the driver is shut down.
     pub async fn open_in_memory() -> Result<Self, StoreError> {
-        let (isle, driver) = AsyncIsle::open_in_memory(|conn| conn.execute_batch(SCHEMA))
+        let (isle, driver) = AsyncIsle::open_in_memory(init_conn)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(Self::from_isle(isle, driver))
@@ -102,7 +102,8 @@ impl SqliteBackends {
     fn from_isle(isle: AsyncIsle, driver: AsyncIsleDriver) -> Self {
         Self {
             events: SqliteEventBackend::new(isle.clone()),
-            cache: SqliteCacheBackend::new(isle),
+            cache: SqliteCacheBackend::new(isle.clone()),
+            checkpoints: SqliteCheckpointBackend::new(isle),
             driver: SqliteBackendDriver { inner: driver },
         }
     }

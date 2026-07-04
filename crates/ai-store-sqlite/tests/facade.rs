@@ -8,7 +8,8 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ai_store_core::{
-    Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig, StoreError, StreamId, Timestamp,
+    CatchUpReport, CheckpointBackend, Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig,
+    StoreError, StreamId, Timestamp,
 };
 use ai_store_sqlite::SqliteBackends;
 use async_trait::async_trait;
@@ -36,6 +37,23 @@ async fn open_facade_with_sinks(be: &SqliteBackends, sinks: Vec<Arc<dyn Projecti
         Vec::new(),
         sinks,
         StoreConfig::default(),
+    )
+}
+
+/// Same as `open_facade_with_sinks`, but wires `be.checkpoints` in as the
+/// persisted `CheckpointBackend` instead of the in-memory-only default.
+async fn open_facade_with_persisted_checkpoints(
+    be: &SqliteBackends,
+    sinks: Vec<Arc<dyn ProjectionSink>>,
+) -> Store {
+    let checkpoint_backend: Arc<dyn CheckpointBackend> = Arc::new(be.checkpoints.clone());
+    Store::with_checkpoint_backend(
+        Arc::new(be.events.clone()),
+        Arc::new(be.cache.clone()),
+        Vec::new(),
+        sinks,
+        StoreConfig::default(),
+        checkpoint_backend,
     )
 }
 
@@ -180,6 +198,75 @@ async fn state_persists_across_reopen() {
                 .unwrap(),
             Seq(2)
         );
+        be.driver.shutdown().await.unwrap();
+    }
+}
+
+// ---- checkpoint persistence across reopen --------------------------------
+
+#[tokio::test]
+async fn persisted_checkpoint_survives_reopen_and_prevents_redrive() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store.db");
+    let s = StreamId::new("doc");
+
+    // First open: attach a persisted-checkpoint sink and drive two events
+    // through it, then shut down (simulating a process restart).
+    {
+        let be = SqliteBackends::open(&path).await.unwrap();
+        let sink = Arc::new(RecordSink {
+            id: "record".to_string(),
+            seen: StdMutex::new(Vec::new()),
+        });
+        let store = open_facade_with_persisted_checkpoints(&be, vec![sink.clone()]).await;
+
+        store
+            .append(
+                &s,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &s,
+                "bump",
+                patch(json!([{ "op": "replace", "path": "/n", "value": 1 }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.seen.lock().unwrap().clone(),
+            vec![("doc".to_string(), 1), ("doc".to_string(), 2)]
+        );
+        // The checkpoint was actually persisted to `sink_checkpoints`, not
+        // just cached in this `Store` instance's in-memory map.
+        assert_eq!(
+            be.checkpoints.get("record", &s).await.unwrap(),
+            Some(Seq(2))
+        );
+
+        be.driver.shutdown().await.unwrap();
+    }
+
+    // Second open: a brand-new `Store` (fresh in-memory checkpoint map) over
+    // the same file restores the checkpoint from the persisted backend and
+    // does not re-drive events the first process already delivered.
+    {
+        let be = SqliteBackends::open(&path).await.unwrap();
+        let sink = Arc::new(RecordSink {
+            id: "record".to_string(),
+            seen: StdMutex::new(Vec::new()),
+        });
+        let store = open_facade_with_persisted_checkpoints(&be, vec![sink.clone()]).await;
+
+        let report = store.catch_up("record").await.unwrap();
+        assert_eq!(report, CatchUpReport::EMPTY);
+        assert!(sink.seen.lock().unwrap().is_empty());
+
         be.driver.shutdown().await.unwrap();
     }
 }

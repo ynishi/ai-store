@@ -68,15 +68,40 @@ pub trait ProjectionSink: Send + Sync {
     }
 }
 
+/// Detail for a single `(stream, sink)` pairing that failed during a
+/// `Store::catch_up` / `Store::rebuild` call.
+///
+/// Recorded once per stream: catch-up isolates failures to the stream that
+/// produced them (order within a stream must be preserved, so the first
+/// failure on a stream halts *that stream only*), and continues driving
+/// every other stream to completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpFailure {
+    /// The stream whose catch-up was interrupted.
+    pub stream: StreamId,
+    /// The sink that failed (matches the `sink_id` argument to `catch_up`).
+    pub sink_id: String,
+    /// Human-readable failure reason (the failing `commit`'s `StoreError`,
+    /// or a note about checkpoint persistence — see
+    /// [`crate::CheckpointBackend`]).
+    pub message: String,
+}
+
 /// Summary returned from `Store::catch_up` and `Store::rebuild`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchUpReport {
     /// Number of events applied to the sink.
     pub applied: usize,
-    /// Number of events skipped (already past the checkpoint).
+    /// Number of events skipped because a prior event on the same stream
+    /// failed. Order must be preserved within a stream, so once an event
+    /// fails, every event after it on that stream is skipped rather than
+    /// applied out of order.
     pub skipped: usize,
     /// Number of events that failed and left the checkpoint unadvanced.
     pub failed: usize,
+    /// One entry per stream whose catch-up failed this call. See
+    /// [`CatchUpFailure`].
+    pub failures: Vec<CatchUpFailure>,
 }
 
 impl CatchUpReport {
@@ -85,5 +110,6 @@ impl CatchUpReport {
         applied: 0,
         skipped: 0,
         failed: 0,
+        failures: Vec::new(),
     };
 }

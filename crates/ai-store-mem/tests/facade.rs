@@ -9,10 +9,11 @@ use std::sync::{
 };
 
 use ai_store_core::{
-    empty_state, CatchUpReport, Event, EventBackend, GateCtx, Label, Patch, ProjectionSink,
-    SchemaGate, SchemaViolation, Seq, Store, StoreConfig, StoreError, StreamId, Timestamp,
+    empty_state, CatchUpReport, CheckpointBackend, Event, EventBackend, GateCtx, Label, Patch,
+    ProjectionSink, SchemaGate, SchemaViolation, Seq, Store, StoreConfig, StoreError, StreamId,
+    Timestamp,
 };
-use ai_store_mem::{MemCacheBackend, MemEventBackend};
+use ai_store_mem::{MemCacheBackend, MemCheckpointBackend, MemEventBackend};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -1036,6 +1037,270 @@ async fn materialize_to_sink_unknown_stream_returns_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::UnknownStream(id) if id == StreamId::new("nope")));
+}
+
+// ---- with_checkpoint_backend --------------------------------------------
+
+#[tokio::test]
+async fn with_checkpoint_backend_survives_a_fresh_store_instance() {
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(MemCacheBackend::new());
+    let checkpoint_backend: Arc<dyn CheckpointBackend> = Arc::new(MemCheckpointBackend::new());
+    let sink = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let s = StreamId::new("doc");
+
+    let store = Store::with_checkpoint_backend(
+        events.clone(),
+        cache.clone(),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+        checkpoint_backend.clone(),
+    );
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "add",
+            patch(json!([{ "op": "add", "path": "/x", "value": 1 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1), ("doc".to_string(), 2)]
+    );
+
+    // The persisted checkpoint backend actually recorded the advance.
+    assert_eq!(
+        checkpoint_backend.get("record", &s).await.unwrap(),
+        Some(Seq(2))
+    );
+
+    // A brand-new `Store` sharing only the backends (fresh in-memory
+    // checkpoint map, as a process restart would produce) restores the
+    // checkpoint from `checkpoint_backend` instead of re-driving from
+    // `Seq(0)`.
+    let sink2 = Arc::new(RecordSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let restarted = Store::with_checkpoint_backend(
+        events,
+        cache,
+        Vec::new(),
+        vec![sink2.clone()],
+        StoreConfig::default(),
+        checkpoint_backend,
+    );
+    let report = restarted.catch_up("record").await.unwrap();
+    assert_eq!(report, CatchUpReport::EMPTY);
+    assert!(sink2.seen.lock().unwrap().is_empty());
+}
+
+// ---- catch_up failure isolation -----------------------------------------
+
+/// A `ProjectionSink` that always fails `commit` for one specific stream and
+/// records every other stream's committed `(stream, seq)` pairs.
+struct StreamFailSink {
+    id: String,
+    fail_stream: StreamId,
+    seen: StdMutex<Vec<(String, u64)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for StreamFailSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        stream: &StreamId,
+        seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        if stream == &self.fail_stream {
+            return Err(StoreError::Backend("stream fail".to_string()));
+        }
+        self.seen
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), seq.0));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn catch_up_isolates_failure_to_one_stream_and_continues_others() {
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(MemCacheBackend::new());
+    let good = StreamId::new("good");
+    let bad = StreamId::new("bad");
+
+    // Build history on both streams with no sink attached, so neither has
+    // any prior dispatch — a single `catch_up` call below has to drive both
+    // from scratch.
+    let store_no_sink = Store::new(
+        events.clone(),
+        cache.clone(),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig::default(),
+    );
+    for stream in [&good, &bad] {
+        // Seq 1: establish an empty object root so the subsequent adds have
+        // a path parent. Seq 2, 3: two more events, for 3 total per stream.
+        store_no_sink
+            .append(
+                stream,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": {} }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        for i in 0..2 {
+            store_no_sink
+                .append(
+                    stream,
+                    "k",
+                    patch(json!([{ "op": "add", "path": format!("/n{i}"), "value": i }])),
+                    json!({}),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let sink = Arc::new(StreamFailSink {
+        id: "faulty".to_string(),
+        fail_stream: bad.clone(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        events,
+        cache,
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    let report = store.catch_up("faulty").await.unwrap();
+
+    // "good" drives to completion: all 3 events applied.
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![
+            ("good".to_string(), 1),
+            ("good".to_string(), 2),
+            ("good".to_string(), 3),
+        ]
+    );
+    assert_eq!(report.applied, 3);
+
+    // "bad" fails at its very first undrivable event (seq 1); the remaining
+    // two (seq 2, seq 3) are counted as skipped rather than silently lost or
+    // applied out of order.
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.skipped, 2);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].stream, bad);
+    assert_eq!(report.failures[0].sink_id, "faulty");
+}
+
+// ---- concurrent per-stream write serialization --------------------------
+
+/// A `SchemaGate` that records the size of `ctx.current` (as a JSON object)
+/// on every validation call. Used to detect a read-validate-write race: if
+/// two concurrent `append`s to the same stream both observe the same
+/// `current`, the same size is recorded twice.
+struct SizeGate {
+    seen: StdMutex<Vec<usize>>,
+}
+
+impl SchemaGate for SizeGate {
+    fn validate(&self, ctx: &GateCtx<'_>) -> Result<(), SchemaViolation> {
+        let size = ctx.current.as_object().map(|o| o.len()).unwrap_or(0);
+        self.seen.lock().unwrap().push(size);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn concurrent_append_to_same_stream_serializes_gate_observations() {
+    let gate = Arc::new(SizeGate {
+        seen: StdMutex::new(Vec::new()),
+    });
+    let gate_dyn: Arc<dyn SchemaGate> = gate.clone();
+    let store = Arc::new(Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        vec![gate_dyn],
+        Vec::new(),
+        StoreConfig::default(),
+    ));
+    let s = StreamId::new("doc");
+
+    // Establish an empty object root so every subsequent add has a path
+    // parent. Clear the gate's log afterward so only the concurrent appends
+    // below are counted.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    gate.seen.lock().unwrap().clear();
+
+    const N: usize = 50;
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let store = store.clone();
+        let s = s.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .append(
+                    &s,
+                    "bump",
+                    patch(json!([{ "op": "add", "path": format!("/task_{i}"), "value": i }])),
+                    json!({}),
+                )
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Each of the N concurrent appends adds exactly one new top-level key.
+    // If `Store::append` correctly serializes the state-read -> gate ->
+    // backend-append critical section per stream, the gate must observe
+    // every size in 0..N exactly once. A duplicate would mean two appends
+    // both read the same pre-write `current` — the TOCTOU this fix closes.
+    let mut seen = gate.seen.lock().unwrap().clone();
+    seen.sort_unstable();
+    let expected: Vec<usize> = (0..N).collect();
+    assert_eq!(seen, expected);
+
+    let final_state = store.state(&s).await.unwrap();
+    assert_eq!(final_state.as_object().unwrap().len(), N);
 }
 
 #[tokio::test]

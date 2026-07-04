@@ -33,13 +33,13 @@ mod id;
 mod sink;
 mod state;
 
-pub use backend::{CacheBackend, EventBackend, SqliteBackend};
+pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
 pub use error::{SchemaViolation, StoreError};
 pub use event::{Event, NewEvent};
 pub use facade::{Store, StoreConfig, REVERT_KIND};
 pub use gate::{GateCtx, SchemaGate};
 pub use id::{Label, Seq, StreamId, Timestamp};
-pub use sink::{CatchUpReport, ProjectionSink};
+pub use sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
 pub use state::{empty_state, replay_from};
 
 // Re-export the patch type so consumers don't need a direct json-patch dep to

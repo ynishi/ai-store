@@ -6,7 +6,8 @@
 //! the backend, and shuts the driver down cleanly at the end.
 
 use ai_store_core::{
-    CacheBackend, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp,
+    CacheBackend, CheckpointBackend, EventBackend, Label, NewEvent, Seq, StoreError, StreamId,
+    Timestamp,
 };
 use ai_store_sqlite::SqliteBackends;
 use json_patch::Patch;
@@ -415,6 +416,59 @@ async fn import_event_on_empty_stream_starts_at_seq_one() {
         .unwrap();
     assert_eq!(seq, Seq(1));
     assert_eq!(be.events.head(&s).await.unwrap(), Some(Seq(1)));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- checkpoint backend ---------------------------------------------------
+
+#[tokio::test]
+async fn checkpoint_put_then_get_round_trips() {
+    let be = fresh().await;
+    let s = StreamId::new("s");
+
+    assert_eq!(be.checkpoints.get("sink-a", &s).await.unwrap(), None);
+
+    be.checkpoints.put("sink-a", &s, Seq(5)).await.unwrap();
+    assert_eq!(
+        be.checkpoints.get("sink-a", &s).await.unwrap(),
+        Some(Seq(5))
+    );
+
+    // A second put overwrites (upsert on the (sink_id, stream) primary key)
+    // rather than accumulating a new row.
+    be.checkpoints.put("sink-a", &s, Seq(9)).await.unwrap();
+    assert_eq!(
+        be.checkpoints.get("sink-a", &s).await.unwrap(),
+        Some(Seq(9))
+    );
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_is_scoped_per_sink_and_per_stream() {
+    let be = fresh().await;
+    let a = StreamId::new("a");
+    let b = StreamId::new("b");
+
+    be.checkpoints.put("sink-1", &a, Seq(1)).await.unwrap();
+    be.checkpoints.put("sink-2", &a, Seq(2)).await.unwrap();
+    be.checkpoints.put("sink-1", &b, Seq(3)).await.unwrap();
+
+    assert_eq!(
+        be.checkpoints.get("sink-1", &a).await.unwrap(),
+        Some(Seq(1))
+    );
+    assert_eq!(
+        be.checkpoints.get("sink-2", &a).await.unwrap(),
+        Some(Seq(2))
+    );
+    assert_eq!(
+        be.checkpoints.get("sink-1", &b).await.unwrap(),
+        Some(Seq(3))
+    );
+    assert_eq!(be.checkpoints.get("sink-2", &b).await.unwrap(), None);
 
     be.driver.shutdown().await.unwrap();
 }

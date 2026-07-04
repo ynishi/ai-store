@@ -8,6 +8,11 @@
 //! `CacheBackend` is a materialization cache for state snapshots. It is a
 //! derived artifact — pruning entries never violates the log's SoT property.
 //!
+//! `CheckpointBackend` persists `ProjectionSink` checkpoints so they survive
+//! process restarts. It is optional — [`crate::Store::new`] runs without one
+//! (checkpoints live only in process memory), and [`crate::Store::with_checkpoint_backend`]
+//! attaches one.
+//!
 //! `SqliteBackend` is a separate, narrower SPI: a generic constructor
 //! pattern for backends built from an existing native handle, so downstream
 //! crates can write handle-agnostic backend factories.
@@ -174,6 +179,37 @@ pub trait CacheBackend: Send + Sync {
 
     /// Prune cached entries for a stream, keeping the `keep_latest` most recent.
     async fn prune(&self, stream: &StreamId, keep_latest: usize) -> Result<(), StoreError>;
+}
+
+/// Persistence for `ProjectionSink` checkpoints (the `(sink_id, stream) ->
+/// Seq` watermark the facade uses to know how far a sink has been driven).
+///
+/// This is an optional SPI: [`crate::Store::new`] runs with checkpoints held
+/// only in process memory, which is safe (sinks are contracted to be
+/// idempotent under redelivery) but means every sink replays its entire
+/// history after a restart. [`crate::Store::with_checkpoint_backend`]
+/// attaches an implementation of this trait so checkpoints survive restarts
+/// instead.
+///
+/// Implementations do not need to be transactional with the event log —
+/// the facade only ever calls [`CheckpointBackend::put`] *after* the
+/// corresponding event is already durable, and a checkpoint that lags
+/// slightly behind (or is momentarily unreadable) only costs a redundant
+/// redelivery on the next `catch_up`, never a lost event.
+#[async_trait]
+pub trait CheckpointBackend: Send + Sync {
+    /// Fetch the persisted checkpoint for `(sink_id, stream)`.
+    ///
+    /// `None` means no checkpoint has ever been recorded for this pair,
+    /// equivalent to `Seq::ZERO` (drive the sink from the very start of the
+    /// stream).
+    async fn get(&self, sink_id: &str, stream: &StreamId) -> Result<Option<Seq>, StoreError>;
+
+    /// Persist the checkpoint for `(sink_id, stream)` as `at`.
+    ///
+    /// Overwrites any previously persisted value. Implementations should
+    /// treat this as an upsert keyed on `(sink_id, stream)`.
+    async fn put(&self, sink_id: &str, stream: &StreamId, at: Seq) -> Result<(), StoreError>;
 }
 
 /// SPI trait for backends built from an existing native storage handle

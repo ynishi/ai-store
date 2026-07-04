@@ -2,13 +2,14 @@
 
 //! # ai-store-sqlite
 //!
-//! SQLite implementations of `EventBackend` and `CacheBackend` for the
-//! ai-store family, using [`rusqlite_isle`] to confine the blocking rusqlite
-//! `Connection` to a dedicated OS thread and expose an async facade.
+//! SQLite implementations of `EventBackend`, `CacheBackend`, and
+//! `CheckpointBackend` for the ai-store family, using [`rusqlite_isle`] to
+//! confine the blocking rusqlite `Connection` to a dedicated OS thread and
+//! expose an async facade.
 //!
 //! ## Architecture
 //!
-//! Both backends hold a cloneable `AsyncIsle` handle. Every mutation
+//! All three backends hold a cloneable `AsyncIsle` handle. Every mutation
 //! (`append`, `label_set`, `put`) executes in a single closure on the SQLite
 //! thread, so:
 //!
@@ -19,7 +20,15 @@
 //! - The tokio task never blocks; every call routes through the isle's mpsc
 //!   channel and awaits a oneshot response.
 //!
-//! ## Schema
+//! ## Schema versioning
+//!
+//! The schema is applied by a stepwise migration runner tracked via
+//! `PRAGMA user_version` (see `migration` module, private to this crate)
+//! rather than a single `CREATE TABLE IF NOT EXISTS` batch. Opening an
+//! existing database re-applies only the migrations it hasn't seen yet;
+//! opening a database from a *newer* build of this crate is rejected rather
+//! than silently misinterpreted. The current schema, as of the latest
+//! migration:
 //!
 //! ```sql
 //! CREATE TABLE events (
@@ -46,6 +55,13 @@
 //!     state  TEXT NOT NULL,   -- serde_json::Value serialized
 //!     PRIMARY KEY (stream, at_seq)
 //! );
+//!
+//! CREATE TABLE sink_checkpoints (
+//!     sink_id TEXT NOT NULL,
+//!     stream  TEXT NOT NULL,
+//!     at_seq  INTEGER NOT NULL,
+//!     PRIMARY KEY (sink_id, stream)
+//! );
 //! ```
 //!
 //! WAL journal mode is enabled at open so multi-reader consumers can proceed
@@ -53,6 +69,7 @@
 
 mod backend;
 mod driver;
+mod migration;
 
-pub use backend::{SqliteCacheBackend, SqliteEventBackend};
+pub use backend::{SqliteCacheBackend, SqliteCheckpointBackend, SqliteEventBackend};
 pub use driver::{SqliteBackendDriver, SqliteBackends};

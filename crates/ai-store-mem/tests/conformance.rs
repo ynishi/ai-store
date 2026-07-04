@@ -5,9 +5,10 @@
 //! future backends (`ai-store-sqlite`, ...) must also satisfy.
 
 use ai_store_core::{
-    CacheBackend, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp,
+    CacheBackend, CheckpointBackend, EventBackend, Label, NewEvent, Seq, StoreError, StreamId,
+    Timestamp,
 };
-use ai_store_mem::{MemCacheBackend, MemEventBackend};
+use ai_store_mem::{MemCacheBackend, MemCheckpointBackend, MemEventBackend};
 use json_patch::Patch;
 use serde_json::json;
 
@@ -346,6 +347,39 @@ async fn import_event_on_empty_stream_starts_at_seq_one() {
         .unwrap();
     assert_eq!(seq, Seq(1));
     assert_eq!(be.head(&s).await.unwrap(), Some(Seq(1)));
+}
+
+// ---- checkpoint backend ---------------------------------------------------
+
+#[tokio::test]
+async fn checkpoint_put_then_get_round_trips() {
+    let backend = MemCheckpointBackend::new();
+    let s = StreamId::new("s");
+
+    assert_eq!(backend.get("sink-a", &s).await.unwrap(), None);
+
+    backend.put("sink-a", &s, Seq(5)).await.unwrap();
+    assert_eq!(backend.get("sink-a", &s).await.unwrap(), Some(Seq(5)));
+
+    // A second put overwrites rather than accumulating.
+    backend.put("sink-a", &s, Seq(9)).await.unwrap();
+    assert_eq!(backend.get("sink-a", &s).await.unwrap(), Some(Seq(9)));
+}
+
+#[tokio::test]
+async fn checkpoint_is_scoped_per_sink_and_per_stream() {
+    let backend = MemCheckpointBackend::new();
+    let a = StreamId::new("a");
+    let b = StreamId::new("b");
+
+    backend.put("sink-1", &a, Seq(1)).await.unwrap();
+    backend.put("sink-2", &a, Seq(2)).await.unwrap();
+    backend.put("sink-1", &b, Seq(3)).await.unwrap();
+
+    assert_eq!(backend.get("sink-1", &a).await.unwrap(), Some(Seq(1)));
+    assert_eq!(backend.get("sink-2", &a).await.unwrap(), Some(Seq(2)));
+    assert_eq!(backend.get("sink-1", &b).await.unwrap(), Some(Seq(3)));
+    assert_eq!(backend.get("sink-2", &b).await.unwrap(), None);
 }
 
 #[tokio::test]

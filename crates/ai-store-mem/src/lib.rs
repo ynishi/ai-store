@@ -2,17 +2,18 @@
 
 //! # ai-store-mem
 //!
-//! In-memory implementations of `EventBackend` and `CacheBackend` for the
-//! ai-store family.
+//! In-memory implementations of `EventBackend`, `CacheBackend`, and
+//! `CheckpointBackend` for the ai-store family.
 //!
 //! ## Architecture
 //!
-//! `MemEventBackend` and `MemCacheBackend` each own a single `tokio::sync::Mutex`
-//! guarding their entire state (per-stream event vectors, label map, cache
-//! entries). This deliberately mirrors the actor discipline used by
-//! `ai-store-sqlite`: a single writer serializes all mutations so that `Seq`
-//! assignment is gap-free and monotonic without any additional coordination on
-//! the caller side.
+//! `MemEventBackend`, `MemCacheBackend`, and `MemCheckpointBackend` each own
+//! a single `tokio::sync::Mutex` guarding their entire state (per-stream
+//! event vectors, label map, cache entries, checkpoint map respectively).
+//! This deliberately mirrors the actor discipline used by `ai-store-sqlite`:
+//! a single writer serializes all mutations so that `Seq` assignment is
+//! gap-free and monotonic without any additional coordination on the caller
+//! side.
 //!
 //! Intended use cases:
 //!
@@ -27,7 +28,9 @@
 //! backend instance.
 
 mod cache;
+mod checkpoint;
 mod event;
 
 pub use cache::MemCacheBackend;
+pub use checkpoint::MemCheckpointBackend;
 pub use event::MemEventBackend;

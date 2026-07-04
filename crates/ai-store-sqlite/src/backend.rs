@@ -7,8 +7,8 @@
 
 use ai_store_core::Patch;
 use ai_store_core::{
-    CacheBackend, Event, EventBackend, Label, NewEvent, Seq, SqliteBackend, StoreError, StreamId,
-    Timestamp,
+    CacheBackend, CheckpointBackend, Event, EventBackend, Label, NewEvent, Seq, SqliteBackend,
+    StoreError, StreamId, Timestamp,
 };
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
@@ -56,6 +56,28 @@ impl SqliteBackend for SqliteCacheBackend {
 
     fn new(handle: AsyncIsle) -> Self {
         SqliteCacheBackend::new(handle)
+    }
+}
+
+/// SQLite-backed `CheckpointBackend`. Cloneable; every clone shares the
+/// same SQLite thread.
+#[derive(Clone)]
+pub struct SqliteCheckpointBackend {
+    isle: AsyncIsle,
+}
+
+impl SqliteCheckpointBackend {
+    /// Build from an existing rusqlite-isle handle.
+    pub fn new(isle: AsyncIsle) -> Self {
+        Self { isle }
+    }
+}
+
+impl SqliteBackend for SqliteCheckpointBackend {
+    type Handle = AsyncIsle;
+
+    fn new(handle: AsyncIsle) -> Self {
+        SqliteCheckpointBackend::new(handle)
     }
 }
 
@@ -489,6 +511,44 @@ impl CacheBackend for SqliteCacheBackend {
                         (SELECT at_seq FROM cache WHERE stream = ?1 \
                          ORDER BY at_seq DESC LIMIT ?2)",
                     params![stream_name, keep],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(to_store_err)
+    }
+}
+
+#[async_trait]
+impl CheckpointBackend for SqliteCheckpointBackend {
+    async fn get(&self, sink_id: &str, stream: &StreamId) -> Result<Option<Seq>, StoreError> {
+        let sink_id = sink_id.to_string();
+        let stream_name = stream.as_str().to_string();
+        let seq: Option<i64> = self
+            .isle
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT at_seq FROM sink_checkpoints WHERE sink_id = ?1 AND stream = ?2",
+                    params![sink_id, stream_name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(to_store_err)?;
+        Ok(seq.map(|s| Seq(s as u64)))
+    }
+
+    async fn put(&self, sink_id: &str, stream: &StreamId, at: Seq) -> Result<(), StoreError> {
+        let sink_id = sink_id.to_string();
+        let stream_name = stream.as_str().to_string();
+        let at_i = at.0 as i64;
+        self.isle
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO sink_checkpoints (sink_id, stream, at_seq) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(sink_id, stream) DO UPDATE SET at_seq = excluded.at_seq",
+                    params![sink_id, stream_name, at_i],
                 )?;
                 Ok(())
             })

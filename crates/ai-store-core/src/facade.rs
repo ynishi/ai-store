@@ -17,12 +17,36 @@
 //! and appends it as a single event, so restoration participates in the same
 //! append-only history as any other write.
 //!
+//! Every write above (`append` / `import_event` / `revert`) executes inside
+//! a per-stream write lock: the state read, gate validation, backend append,
+//! cache write, and sink dispatch for a single stream never interleave with
+//! another concurrent write to that *same* stream. Writes to different
+//! streams remain fully concurrent — the lock is keyed on `StreamId`, not
+//! global. This closes a read-validate-write race: without it, two
+//! concurrent writers could both read the same `current` state, both pass
+//! gate validation against it, and both append — each backend-assigns its
+//! own `Seq` correctly, but a gate enforcing a postcondition on `next` (e.g.
+//! "at most N children") could be fooled because it never saw the other
+//! writer's effect.
+//!
 //! ## Checkpoint storage note
 //!
-//! Sink checkpoints are held in memory on the facade. A restarted process
-//! will re-drive every sink from `Seq(0)`; this is safe because sinks are
-//! contracted to be idempotent under retries. Persistent checkpoints are a
-//! deliberate follow-up (typically co-located in the `EventBackend`'s DB).
+//! Sink checkpoints are held in memory by default ([`Store::new`]). A
+//! restarted process then re-drives every sink from `Seq(0)`; this is safe
+//! because sinks are contracted to be idempotent under retries, but it does
+//! mean every sink replays its entire history after every restart.
+//!
+//! [`Store::with_checkpoint_backend`] attaches a [`crate::CheckpointBackend`]
+//! so checkpoints survive process restarts instead: the in-memory map still
+//! serves as an L1 cache, but a miss falls back to
+//! [`crate::CheckpointBackend::get`] instead of assuming `Seq::ZERO`, and
+//! every checkpoint advance persists via [`crate::CheckpointBackend::put`]
+//! before it is considered durable. Backend read/write failures fail *open*
+//! (treated as "no checkpoint" / "advance not yet durable") rather than
+//! aborting the write or the catch-up loop — consistent with the
+//! idempotence contract sinks already have to uphold, and strictly safer
+//! than the alternative of blocking a successful backend append on
+//! checkpoint bookkeeping.
 //!
 //! ## Cost model for large stream states
 //!
@@ -72,18 +96,18 @@
 //! per-entity histories without linear scans.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use json_patch::diff;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::backend::{CacheBackend, EventBackend};
+use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
 use crate::error::StoreError;
 use crate::event::{Event, NewEvent};
 use crate::gate::{GateCtx, SchemaGate};
 use crate::id::{Label, Seq, StreamId, Timestamp};
-use crate::sink::{CatchUpReport, ProjectionSink};
+use crate::sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
 use crate::state::{empty_state, replay_from};
 
 /// Kind used for the internal event a `revert` writes to the log.
@@ -110,11 +134,29 @@ pub struct Store {
     gates: Vec<Arc<dyn SchemaGate>>,
     sinks: Vec<Arc<dyn ProjectionSink>>,
     checkpoints: Arc<Mutex<HashMap<(String, StreamId), Seq>>>,
+    checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
+    /// Per-stream write lock, keyed on `StreamId`. Serializes the
+    /// state-read -> gate -> backend-append -> sink-dispatch critical
+    /// section of `append` / `import_event` / `revert` for a single stream,
+    /// while leaving different streams fully concurrent. Guarded by a plain
+    /// `std::sync::Mutex` (the critical section here is just a hashmap
+    /// lookup/insert, never held across an `.await`); the inner lock is a
+    /// `tokio::sync::Mutex` because *that* guard is held across awaits.
+    ///
+    /// Entries are never evicted — long-running processes that write to an
+    /// unbounded number of distinct streams will accumulate one entry per
+    /// stream ever seen. This mirrors the existing `checkpoints` map (same
+    /// trade-off, same justification: the alternative is a correctness bug).
+    stream_locks: Arc<StdMutex<HashMap<StreamId, Arc<Mutex<()>>>>>,
     config: StoreConfig,
 }
 
 impl Store {
     /// Construct a store from a backend pair plus optional gates and sinks.
+    ///
+    /// Sink checkpoints live only in process memory — see the crate-level
+    /// "Checkpoint storage note". Use [`Store::with_checkpoint_backend`] for
+    /// checkpoints that survive a restart.
     pub fn new(
         events: Arc<dyn EventBackend>,
         cache: Arc<dyn CacheBackend>,
@@ -122,13 +164,129 @@ impl Store {
         sinks: Vec<Arc<dyn ProjectionSink>>,
         config: StoreConfig,
     ) -> Self {
+        Self::new_inner(events, cache, gates, sinks, config, None)
+    }
+
+    /// Construct a store whose sink checkpoints are restored from (and
+    /// persisted to) `checkpoint_backend`, surviving process restarts.
+    ///
+    /// Everything else is identical to [`Store::new`] — the same gates
+    /// validate writes, the same sinks are dispatched, the same cache-stride
+    /// rule governs materialization. See the crate-level "Checkpoint
+    /// storage note" for the durability contract this adds.
+    pub fn with_checkpoint_backend(
+        events: Arc<dyn EventBackend>,
+        cache: Arc<dyn CacheBackend>,
+        gates: Vec<Arc<dyn SchemaGate>>,
+        sinks: Vec<Arc<dyn ProjectionSink>>,
+        config: StoreConfig,
+        checkpoint_backend: Arc<dyn CheckpointBackend>,
+    ) -> Self {
+        Self::new_inner(
+            events,
+            cache,
+            gates,
+            sinks,
+            config,
+            Some(checkpoint_backend),
+        )
+    }
+
+    fn new_inner(
+        events: Arc<dyn EventBackend>,
+        cache: Arc<dyn CacheBackend>,
+        gates: Vec<Arc<dyn SchemaGate>>,
+        sinks: Vec<Arc<dyn ProjectionSink>>,
+        config: StoreConfig,
+        checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
+    ) -> Self {
         Self {
             events,
             cache,
             gates,
             sinks,
             checkpoints: Arc::new(Mutex::new(HashMap::new())),
+            checkpoint_backend,
+            stream_locks: Arc::new(StdMutex::new(HashMap::new())),
             config,
+        }
+    }
+
+    /// Return the (cloned) per-stream write lock for `stream`, creating an
+    /// entry if this is the first time `stream` has been written to.
+    fn stream_lock(&self, stream: &StreamId) -> Arc<Mutex<()>> {
+        let mut locks = self.stream_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(stream.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Look up `sink_id`'s checkpoint for `stream`.
+    ///
+    /// Consults the in-memory cache first; on a miss, restores from the
+    /// persisted [`CheckpointBackend`] (if one is configured) instead of
+    /// assuming `Seq::ZERO` — this is what makes checkpoints survive a
+    /// restart. A backend read failure is treated the same as "no
+    /// checkpoint found" (fail open): sinks are contracted to be idempotent
+    /// under redelivery, so the worst case is a redundant re-dispatch on the
+    /// next `catch_up`, never a missed one.
+    async fn checkpoint_get(&self, sink_id: &str, stream: &StreamId) -> Seq {
+        let key = (sink_id.to_string(), stream.clone());
+        {
+            let cps = self.checkpoints.lock().await;
+            if let Some(seq) = cps.get(&key) {
+                return *seq;
+            }
+        }
+        let restored = match &self.checkpoint_backend {
+            Some(backend) => backend
+                .get(sink_id, stream)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(Seq::ZERO),
+            None => Seq::ZERO,
+        };
+        let mut cps = self.checkpoints.lock().await;
+        cps.entry(key).or_insert(restored);
+        restored
+    }
+
+    /// Advance `sink_id`'s checkpoint for `stream` to `seq`.
+    ///
+    /// When a [`CheckpointBackend`] is configured, persists first and only
+    /// updates the in-memory cache on success — returning `false` and
+    /// leaving the in-memory value untouched if persistence fails. This
+    /// keeps memory and backend from drifting apart: a failed persist here
+    /// means the next `catch_up` re-drives from the last *durably* recorded
+    /// position, rather than from a position only this process remembers.
+    async fn checkpoint_advance(&self, sink_id: &str, stream: &StreamId, seq: Seq) -> bool {
+        if let Some(backend) = &self.checkpoint_backend {
+            if backend.put(sink_id, stream, seq).await.is_err() {
+                return false;
+            }
+        }
+        let mut cps = self.checkpoints.lock().await;
+        cps.insert((sink_id.to_string(), stream.clone()), seq);
+        true
+    }
+
+    /// Reset `sink_id`'s checkpoint for `stream` to zero, in memory and
+    /// (best-effort) in the [`CheckpointBackend`].
+    ///
+    /// A failed persist here is not surfaced: the very next successful
+    /// [`Store::checkpoint_advance`] call re-persists the correct seq,
+    /// self-healing the drift. Reset is only ever a prelude to immediately
+    /// driving the sink forward again (see [`Store::rebuild`]), so there is
+    /// no window where a stale persisted value would be read back.
+    async fn checkpoint_reset(&self, sink_id: &str, stream: &StreamId) {
+        {
+            let mut cps = self.checkpoints.lock().await;
+            cps.remove(&(sink_id.to_string(), stream.clone()));
+        }
+        if let Some(backend) = &self.checkpoint_backend {
+            let _ = backend.put(sink_id, stream, Seq::ZERO).await;
         }
     }
 
@@ -149,7 +307,10 @@ impl Store {
         patch: json_patch::Patch,
         meta: Value,
     ) -> Result<Seq, StoreError> {
-        self.write_event(stream, kind, patch, meta, None).await
+        let lock = self.stream_lock(stream);
+        let _guard = lock.lock().await;
+        self.write_event_locked(stream, kind, patch, meta, None)
+            .await
     }
 
     /// Import one event into `stream`, recording `at` as its time coordinate
@@ -209,7 +370,10 @@ impl Store {
         meta: Value,
         at: Timestamp,
     ) -> Result<Seq, StoreError> {
-        self.write_event(stream, kind, patch, meta, Some(at)).await
+        let lock = self.stream_lock(stream);
+        let _guard = lock.lock().await;
+        self.write_event_locked(stream, kind, patch, meta, Some(at))
+            .await
     }
 
     /// Shared write path for [`Store::append`] and [`Store::import_event`].
@@ -219,7 +383,13 @@ impl Store {
     /// (backend stamps the supplied timestamp). Every other step — gate
     /// validation, `next` materialization, cache write, sink dispatch — is
     /// identical between the two callers.
-    async fn write_event(
+    ///
+    /// Callers must hold `self.stream_lock(stream)` before calling this —
+    /// it assumes exclusive access to `stream`'s write path and does not
+    /// acquire the lock itself, so that [`Store::revert`] can take the lock
+    /// once and cover both its own state reads and this method's body in a
+    /// single critical section.
+    async fn write_event_locked(
         &self,
         stream: &StreamId,
         kind: &str,
@@ -296,11 +466,7 @@ impl Store {
                 let events = self.events.read(stream, seq, 1).await?;
                 if let Some(ev) = events.into_iter().next() {
                     for sink in &self.sinks {
-                        let key = (sink.id().to_string(), stream.clone());
-                        let checkpoint = {
-                            let cps = self.checkpoints.lock().await;
-                            cps.get(&key).copied().unwrap_or(Seq::ZERO)
-                        };
+                        let checkpoint = self.checkpoint_get(sink.id(), stream).await;
                         // Skip if already past this seq (catch_up ran concurrently).
                         if seq <= checkpoint {
                             continue;
@@ -309,9 +475,10 @@ impl Store {
                             // Only advance the checkpoint contiguously. If there is
                             // a gap (an earlier seq failed dispatch), leave the
                             // checkpoint parked so catch_up will re-drive the gap.
+                            // A failed persist (see `checkpoint_advance`) is
+                            // likewise left parked for catch_up to redrive.
                             if seq == checkpoint.next() {
-                                let mut cps = self.checkpoints.lock().await;
-                                cps.insert(key, seq);
+                                self.checkpoint_advance(sink.id(), stream, seq).await;
                             }
                         }
                     }
@@ -361,12 +528,21 @@ impl Store {
     /// Revert `stream` to the state at `to` by appending the reverse diff as a
     /// new event. The prior state stays in the log; recovery from mistakes is
     /// yet another revert.
+    ///
+    /// Holds the per-stream write lock across both the `current`/`target`
+    /// reads and the resulting append, so no concurrent write to `stream`
+    /// can land between "diff computed against `current`" and "diff
+    /// appended" — that gap would otherwise let the reverse patch apply on
+    /// top of a `current` that is no longer the stream's real state.
     pub async fn revert(&self, stream: &StreamId, to: Seq) -> Result<Seq, StoreError> {
+        let lock = self.stream_lock(stream);
+        let _guard = lock.lock().await;
         let current = self.state(stream).await?;
         let target = self.state_at(stream, to).await?;
         let patch = diff(&current, &target);
         let meta = serde_json::json!({ "revert_to": to.0 });
-        self.append(stream, REVERT_KIND, patch, meta).await
+        self.write_event_locked(stream, REVERT_KIND, patch, meta, None)
+            .await
     }
 
     /// Enumerate events. See `EventBackend::read`.
@@ -550,6 +726,15 @@ impl Store {
         self.catch_up_inner(sink_id, true).await
     }
 
+    /// Drive `sink_id` forward on every stream, isolating failures per
+    /// stream rather than aborting the whole call on the first one.
+    ///
+    /// A failing `commit` (or a failed checkpoint persist — see
+    /// [`Store::checkpoint_advance`]) halts catch-up for *that stream only*:
+    /// order within a stream must be preserved, so every remaining event on
+    /// the failed stream is counted in [`CatchUpReport::skipped`] rather
+    /// than applied out of order, and one [`CatchUpFailure`] is recorded.
+    /// Every other stream is still driven to completion in the same call.
     async fn catch_up_inner(
         &self,
         sink_id: &str,
@@ -563,22 +748,17 @@ impl Store {
 
         for stream in streams {
             if reset {
-                let mut cps = self.checkpoints.lock().await;
-                cps.remove(&(sink_id.to_string(), stream.clone()));
+                self.checkpoint_reset(sink_id, &stream).await;
             }
 
             let head = match self.events.head(&stream).await? {
                 Some(h) => h,
                 None => continue,
             };
-            let mut cursor = {
-                let cps = self.checkpoints.lock().await;
-                cps.get(&(sink_id.to_string(), stream.clone()))
-                    .copied()
-                    .unwrap_or(Seq::ZERO)
-            };
+            let mut cursor = self.checkpoint_get(sink_id, &stream).await;
+            let mut stream_failed = false;
 
-            while cursor < head {
+            while cursor < head && !stream_failed {
                 let from = cursor.next();
                 let events = self.events.read(&stream, from, 32).await?;
                 if events.is_empty() {
@@ -588,15 +768,35 @@ impl Store {
                     let state = self.state_at(&stream, ev.seq).await?;
                     match sink.commit(&stream, ev.seq, &state, &ev).await {
                         Ok(()) => {
-                            report.applied += 1;
-                            cursor = ev.seq;
-                            let mut cps = self.checkpoints.lock().await;
-                            cps.insert((sink_id.to_string(), stream.clone()), ev.seq);
+                            if self.checkpoint_advance(sink_id, &stream, ev.seq).await {
+                                report.applied += 1;
+                                cursor = ev.seq;
+                            } else {
+                                report.failed += 1;
+                                report.failures.push(CatchUpFailure {
+                                    stream: stream.clone(),
+                                    sink_id: sink_id.to_string(),
+                                    message: "checkpoint persistence failed".to_string(),
+                                });
+                                report.skipped += (head.0 - ev.seq.0) as usize;
+                                stream_failed = true;
+                                break;
+                            }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             report.failed += 1;
-                            // Leave checkpoint at cursor (not advanced past this seq).
-                            return Ok(report);
+                            report.failures.push(CatchUpFailure {
+                                stream: stream.clone(),
+                                sink_id: sink_id.to_string(),
+                                message: e.to_string(),
+                            });
+                            // Every event after this one on `stream` is
+                            // un-processed, not just un-counted — order must
+                            // be preserved so we cannot skip ahead to a
+                            // later seq while this one is unacknowledged.
+                            report.skipped += (head.0 - ev.seq.0) as usize;
+                            stream_failed = true;
+                            break;
                         }
                     }
                 }
