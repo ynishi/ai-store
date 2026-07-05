@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ai_store_core::{
     CatchUpReport, CheckpointBackend, Event, Patch, ProjectionSink, Seq, Store, StoreConfig,
-    StoreError, StreamId, Timestamp,
+    StoreError, StreamId, Timestamp, TOMBSTONE_KIND,
 };
 use ai_store_sqlite::{Filter, Order, Query, SqliteBackends, SqliteReadModel};
 use rusqlite::Connection;
@@ -244,6 +244,65 @@ async fn count_get_and_tail() {
 }
 
 // ---- 4. tombstone kind ------------------------------------------------------
+
+#[tokio::test]
+async fn default_tombstone_kind_matches_store_delete() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    // Note: SqliteReadModel::new() no longer requires with_tombstone_kind —
+    // it defaults to the core-level TOMBSTONE_KIND, so Store::delete()
+    // integrates without any extra wiring.
+    let rm = SqliteReadModel::new(be.isle());
+    let sinks: Vec<Arc<dyn ProjectionSink>> = vec![Arc::new(rm.clone())];
+    let store = Store::new(
+        Arc::new(be.events.clone()),
+        Arc::new(be.cache.clone()),
+        Vec::new(),
+        sinks,
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc-1");
+
+    store
+        .append(&s, "created", set_root(json!({ "title": "x" })), json!({}))
+        .await
+        .unwrap();
+    assert!(rm.get(&s).await.unwrap().unwrap().live);
+
+    store.delete(&s, json!({})).await.unwrap();
+    // The tombstone event used TOMBSTONE_KIND; the read-model's default
+    // recognizes it and flips `live` to false.
+    assert_eq!(rm.query(&Query::default()).await.unwrap().len(), 0);
+    assert!(!rm.get(&s).await.unwrap().unwrap().live);
+    let _ = TOMBSTONE_KIND; // touch the re-export so this stays a compile-time link
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn without_tombstone_kind_disables_live_toggling() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let rm = SqliteReadModel::new(be.isle()).without_tombstone_kind();
+    let sinks: Vec<Arc<dyn ProjectionSink>> = vec![Arc::new(rm.clone())];
+    let store = Store::new(
+        Arc::new(be.events.clone()),
+        Arc::new(be.cache.clone()),
+        Vec::new(),
+        sinks,
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc-1");
+
+    store
+        .append(&s, "created", set_root(json!({ "title": "x" })), json!({}))
+        .await
+        .unwrap();
+    // Even Store::delete() (whose kind is TOMBSTONE_KIND) leaves live=true
+    // when tombstoning is disabled on this sink.
+    store.delete(&s, json!({})).await.unwrap();
+    assert!(rm.get(&s).await.unwrap().unwrap().live);
+
+    be.driver.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn tombstone_kind_toggles_live_and_revives_on_further_append() {

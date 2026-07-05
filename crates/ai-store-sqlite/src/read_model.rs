@@ -32,18 +32,32 @@
 //! older-seq redelivery is also a no-op rather than rewinding the row to a
 //! stale state.
 //!
-//! ## Tombstones are a minimal hook, not a delete model
+//! ## Tombstones follow the core delete convention
 //!
-//! [`SqliteReadModel::with_tombstone_kind`] flips `live` to `0` when a
-//! committed event's `kind` matches the configured tombstone kind, and back
-//! to `1` on every other kind (so a further append "revives" the stream).
-//! This is deliberately shallow: there is no cascading removal from
-//! [`SqliteReadModel::query`]'s default result set beyond the `live = 1`
-//! filter (toggle with `Query::include_dead`), and no interaction with
-//! `Store::streams` or the event log itself. Real delete semantics (e.g.
-//! excluding tombstoned streams from `Store::streams`) are out of scope here.
+//! [`SqliteReadModel::new`] defaults to recognizing
+//! [`ai_store_core::TOMBSTONE_KIND`] — the same canonical kind
+//! [`ai_store_core::Store::delete`] appends — so a consumer that uses the
+//! core-level delete API gets `live = 0` for tombstoned streams without
+//! duplicating a kind string. Override with [`SqliteReadModel::with_tombstone_kind`]
+//! only when the consumer has its own pre-existing kind convention that
+//! predates the core constant, and opt out entirely with
+//! [`SqliteReadModel::without_tombstone_kind`] when tombstoning should be
+//! disabled for this sink.
+//!
+//! `live` toggles both ways: a committed event whose `kind` matches the
+//! configured tombstone kind flips `live` to `0`, and any other kind flips it
+//! back to `1` — so a further non-tombstone append "revives" the stream.
+//! [`SqliteReadModel::query`] filters `live = 1` by default (toggle with
+//! `Query::include_dead`), while [`SqliteReadModel::get`] returns tombstoned
+//! rows so callers can inspect `ReadModelRow::live`. This module intentionally
+//! stays inside its projection table — cross-stream listings that respect the
+//! delete convention without a read model live on the facade
+//! ([`ai_store_core::Store::streams_live`]), and physical log compaction is a
+//! separate concern tracked in the retention issue.
 
-use ai_store_core::{Event, ProjectionSink, Seq, SqliteBackend, StoreError, StreamId, Timestamp};
+use ai_store_core::{
+    Event, ProjectionSink, Seq, SqliteBackend, StoreError, StreamId, Timestamp, TOMBSTONE_KIND,
+};
 use async_trait::async_trait;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, OptionalExtension};
@@ -297,13 +311,19 @@ pub struct SqliteReadModel {
 
 impl SqliteReadModel {
     /// Build from an existing rusqlite-isle handle, with the default sink id
-    /// `"read-model"` and no tombstone kind configured (every committed
-    /// stream stays `live = 1`).
+    /// `"read-model"` and the core-level tombstone kind
+    /// ([`ai_store_core::TOMBSTONE_KIND`]) preconfigured — so
+    /// [`ai_store_core::Store::delete`] flips `live` to `0` on this sink
+    /// without any extra wiring.
+    ///
+    /// Override the kind with [`SqliteReadModel::with_tombstone_kind`] when
+    /// the consumer has an incompatible pre-existing convention, or disable
+    /// tombstoning entirely with [`SqliteReadModel::without_tombstone_kind`].
     pub fn new(isle: AsyncIsle) -> Self {
         Self {
             isle,
             id: "read-model".to_string(),
-            tombstone_kind: None,
+            tombstone_kind: Some(TOMBSTONE_KIND.to_string()),
         }
     }
 
@@ -315,14 +335,29 @@ impl SqliteReadModel {
         self
     }
 
-    /// Configure a tombstone event kind: a committed event whose `kind`
+    /// Override the tombstone event kind. A committed event whose `kind`
     /// matches sets the row's `live` to `0`; any other kind sets it back to
-    /// `1`. Without this, `live` is always `1`.
+    /// `1`.
     ///
-    /// This is a minimal hook, not a delete model — see the module-level
-    /// rustdoc "Tombstones" section for what it deliberately does not do.
+    /// [`SqliteReadModel::new`] already configures
+    /// [`ai_store_core::TOMBSTONE_KIND`] — reach for this method only when
+    /// the consumer has its own pre-existing kind convention that predates the
+    /// core constant. New code should prefer [`ai_store_core::Store::delete`]
+    /// and rely on the default.
     pub fn with_tombstone_kind(mut self, kind: impl Into<String>) -> Self {
         self.tombstone_kind = Some(kind.into());
+        self
+    }
+
+    /// Disable tombstone-driven `live` toggling: every committed event leaves
+    /// the row `live = 1` regardless of `kind`.
+    ///
+    /// Use this when a consumer wants the read-model as a pure
+    /// latest-state-per-stream projection with no delete semantics — for
+    /// example when tombstoning is enforced elsewhere and duplicating it
+    /// here would be misleading.
+    pub fn without_tombstone_kind(mut self) -> Self {
+        self.tombstone_kind = None;
         self
     }
 

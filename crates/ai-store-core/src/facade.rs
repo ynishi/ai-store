@@ -94,6 +94,34 @@
 //! high-single-digit MB and no gate genuinely needs the whole document as
 //! one unit. `read_by_meta` (indexed on the SQLite backend) then answers
 //! per-entity histories without linear scans.
+//!
+//! ## How deletion works
+//!
+//! Deletion is an event, not a physical removal from the log. [`Store::delete`]
+//! appends a single event of kind [`TOMBSTONE_KIND`] through the same
+//! `SchemaGate` + `ProjectionSink` pipeline as any other write, carrying an
+//! empty patch (the materialized state does not change). Downstream consumers
+//! recognize the tombstone by matching the kind against `TOMBSTONE_KIND`
+//! rather than a per-consumer string:
+//!
+//! - [`Store::streams_live`] enumerates streams whose most recent event is
+//!   *not* a tombstone, without requiring a read-model round-trip.
+//! - The SQLite read-model sink (`SqliteReadModel`) flips its per-row `live`
+//!   flag to `0` on the tombstone and back to `1` on any subsequent
+//!   non-tombstone event, so the same append that "deletes" a stream can be
+//!   followed by another that "revives" it.
+//! - A [`crate::KindGate`] can register a validator on `TOMBSTONE_KIND` (or
+//!   use it inside a fallback) to enforce a delete policy — e.g. reject
+//!   further appends after a tombstone. `KindGate` itself does not special-case
+//!   the constant, mirroring how it treats [`REVERT_KIND`].
+//!
+//! Because the tombstone is a normal event on the log, `state_at(stream, seq)`
+//! for a `seq` *before* the tombstone still reconstructs the pre-delete state
+//! bit-for-bit, and [`Store::revert`] to that `seq` produces a new event whose
+//! reverse patch is empty (the tombstone did not change state) — the "undo"
+//! for a delete is really the *next* non-tombstone append. Physical removal of
+//! events (log compaction / retention) is a separate concern tracked in the
+//! retention issue and is deliberately out of scope here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -113,6 +141,16 @@ use crate::state::{empty_state, replay_from};
 
 /// Kind used for the internal event a `revert` writes to the log.
 pub const REVERT_KIND: &str = "reverted";
+
+/// Canonical kind for the tombstone event [`Store::delete`] appends.
+///
+/// Deletion in ai-store is an event, not an out-of-band flag: `Store::delete`
+/// appends an event of this kind through the same gate + sink pipeline as any
+/// other write, and downstream consumers (`SqliteReadModel`, `KindGate`
+/// validators, `Store::streams_live`) recognize it by matching this constant
+/// rather than a per-consumer string. See the "How deletion works" section in
+/// the module-level rustdoc.
+pub const TOMBSTONE_KIND: &str = "tombstoned";
 
 /// Configuration knobs for a `Store` instance.
 #[derive(Debug, Clone)]
@@ -631,6 +669,35 @@ impl Store {
             .await
     }
 
+    /// Mark `stream` as deleted by appending a tombstone event of kind
+    /// [`TOMBSTONE_KIND`].
+    ///
+    /// The tombstone carries an empty patch — the materialized state does not
+    /// change — but the event itself flows through the same write path as
+    /// [`Store::append`]: every registered [`SchemaGate`] validates it, the
+    /// per-stream write lock serializes it, and every accepting
+    /// [`ProjectionSink`] receives it. `meta` is opaque to the store (same
+    /// contract as `append`); pass `Value::Null` (or `Value::Object(Map::new())`)
+    /// when there is nothing to attribute.
+    ///
+    /// This is a *convention*, not a physical removal: history stays
+    /// append-only, `state_at(stream, seq)` for any `seq` before the tombstone
+    /// still reconstructs the pre-delete state, and a further non-tombstone
+    /// [`Store::append`] "revives" the stream (see the "How deletion works"
+    /// section in the module-level rustdoc). Consumers that want to reject
+    /// writes after a tombstone should register a [`crate::KindGate`]
+    /// validator; consumers that want to hide tombstoned streams from a
+    /// listing should use [`Store::streams_live`] or the read-model's
+    /// `live = 1` filter.
+    pub async fn delete(&self, stream: &StreamId, meta: Value) -> Result<Committed, StoreError> {
+        let empty_patch: json_patch::Patch = serde_json::from_value(Value::Array(Vec::new()))
+            .expect("empty JSON array parses as an empty JSON Patch");
+        let lock = self.stream_lock(stream);
+        let _guard = lock.lock().await;
+        self.write_event_locked(stream, TOMBSTONE_KIND, empty_patch, meta, None)
+            .await
+    }
+
     /// Enumerate events. See `EventBackend::read`.
     pub async fn read(
         &self,
@@ -676,6 +743,39 @@ impl Store {
     /// Enumerate all streams.
     pub async fn streams(&self) -> Result<Vec<StreamId>, StoreError> {
         self.events.streams().await
+    }
+
+    /// Enumerate streams whose most recent event is *not* a tombstone (see
+    /// [`Store::delete`] / [`TOMBSTONE_KIND`]).
+    ///
+    /// Streams whose entire history was appended via non-tombstone kinds are
+    /// included; streams that never received a [`Store::delete`] but did
+    /// receive a subsequent non-tombstone [`Store::append`] after one are
+    /// included too (the tombstone is not the *most recent* event any more).
+    /// Streams with no events at all are excluded — [`Store::streams`] does not
+    /// return them either.
+    ///
+    /// This is the "listing without a read model" path: it walks every stream
+    /// and reads its head event, so cost is O(N) in stream count with one
+    /// additional backend `read` per stream. When a [`crate::ProjectionSink`]
+    /// like `SqliteReadModel` is already materializing a `live` flag, its
+    /// indexed query is cheaper and preferable — this method is the fallback
+    /// for callers that have no read model wired up (or want a live listing
+    /// without depending on one).
+    pub async fn streams_live(&self) -> Result<Vec<StreamId>, StoreError> {
+        let all = self.events.streams().await?;
+        let mut out = Vec::with_capacity(all.len());
+        for stream in all {
+            let Some(head) = self.events.head(&stream).await? else {
+                continue;
+            };
+            let events = self.events.read(&stream, head, 1).await?;
+            let is_tombstoned = events.first().is_some_and(|e| e.kind == TOMBSTONE_KIND);
+            if !is_tombstoned {
+                out.push(stream);
+            }
+        }
+        Ok(out)
     }
 
     /// Pin `label` on `stream` to `at`.

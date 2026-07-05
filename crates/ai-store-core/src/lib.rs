@@ -40,7 +40,7 @@ pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
 pub use builder::StoreBuilder;
 pub use error::{SchemaViolation, StoreError};
 pub use event::{Committed, Event, NewEvent};
-pub use facade::{Store, StoreConfig, REVERT_KIND};
+pub use facade::{Store, StoreConfig, REVERT_KIND, TOMBSTONE_KIND};
 pub use gate::{GateCtx, SchemaGate};
 pub use id::{Label, Seq, StreamId, Timestamp};
 pub use kind_gate::KindGate;

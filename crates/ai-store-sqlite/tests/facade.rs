@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use ai_store_core::{
     CatchUpReport, CheckpointBackend, Event, Label, Patch, ProjectionSink, Seq, Store, StoreConfig,
-    StoreError, StreamId, Timestamp,
+    StoreError, StreamId, Timestamp, TOMBSTONE_KIND,
 };
 use ai_store_sqlite::SqliteBackends;
 use async_trait::async_trait;
@@ -964,6 +964,101 @@ async fn materialize_to_sink_unknown_stream_returns_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::UnknownStream(id) if id == StreamId::new("nope")));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- first-class delete semantics -----------------------------------------
+
+#[tokio::test]
+async fn delete_appends_tombstone_kind_and_keeps_state_replayable() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let committed = store.delete(&s, json!({ "actor": "alice" })).await.unwrap();
+    assert_eq!(committed.seq, Seq(2));
+
+    // The tombstone event is a normal log entry: it has TOMBSTONE_KIND, an
+    // empty patch, and its meta was passed through untouched.
+    let events = store.read(&s, Seq(2), 1).await.unwrap();
+    let ev = &events[0];
+    assert_eq!(ev.kind, TOMBSTONE_KIND);
+    assert_eq!(ev.meta, json!({ "actor": "alice" }));
+    assert!(ev.patch.0.is_empty(), "tombstone patch must be empty");
+
+    // History reconstruction is unchanged: state before the tombstone is
+    // still the pre-delete state; state after is the same (empty patch).
+    assert_eq!(store.state_at(&s, Seq(1)).await.unwrap(), json!({ "n": 1 }));
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 1 }));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streams_live_excludes_streams_whose_head_is_a_tombstone() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+
+    let live = StreamId::new("live-1");
+    let deleted = StreamId::new("deleted-1");
+    let revived = StreamId::new("revived-1");
+
+    for s in [&live, &deleted, &revived] {
+        store
+            .append(
+                s,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": { "n": 0 } }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Tombstone `deleted` and `revived`, then append a non-tombstone event to
+    // `revived` so its head is no longer the tombstone.
+    store.delete(&deleted, json!({})).await.unwrap();
+    store.delete(&revived, json!({})).await.unwrap();
+    store
+        .append(
+            &revived,
+            "restored",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 1 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let mut all = store.streams().await.unwrap();
+    all.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(all, vec![deleted.clone(), live.clone(), revived.clone()]);
+
+    let mut live_streams = store.streams_live().await.unwrap();
+    live_streams.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(live_streams, vec![live, revived]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streams_live_excludes_streams_with_no_events() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+
+    // No writes at all: both listings are empty.
+    assert!(store.streams().await.unwrap().is_empty());
+    assert!(store.streams_live().await.unwrap().is_empty());
 
     be.driver.shutdown().await.unwrap();
 }
