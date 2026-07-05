@@ -329,25 +329,52 @@
 //!    (see the "Compaction and history boundary" section) — the
 //!    snapshot event captures the current-shape state and drops the
 //!    old-shape prefix from the log entirely.
+//!
+//! ## Module layout
+//!
+//! This module is split by responsibility, all as inherent `impl Store`
+//! blocks over the one [`Store`] type defined here:
+//!
+//! - [`write`] — `append` / `append_if_head` / `import_event` /
+//!   `write_event_locked` / `revert` / `revert_with_meta` / `delete` /
+//!   `prune_cache`.
+//! - [`read`] — `state` / `state_at` / `read` / `read_by_meta` / `head` /
+//!   `seq_at_time` / `streams` / `streams_live`.
+//! - [`labels`] — `label_set` / `label_resolve` / `labels` / `label_delete`.
+//! - [`lifecycle`] — `materialize_to_sink` / `catch_up` / `rebuild` /
+//!   `catch_up_inner`.
+//!
+//! This file keeps the type definitions (`Store`, `StoreConfig`,
+//! `WriteMode`), the public constructors, and the private helper shared
+//! across every submodule (`stream_lock`). Sink registry, checkpoint
+//! bookkeeping, and failure-observer dispatch live on the separate
+//! [`crate::dispatcher::SinkDispatcher`] collaborator held in the
+//! `dispatcher` field — see its module-level rustdoc for the
+//! responsibility split. Upcaster chain application likewise lives off
+//! this file, on the separate [`crate::upcasting_backend::UpcastingBackend`]
+//! decorator that `events` is wrapped in whenever a chain is registered
+//! (see [`Store::new_inner_full`]) — every submodule that reads through
+//! `self.events` gets already-upcasted events without calling anything
+//! upcaster-specific itself.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use json_patch::diff;
-use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
 use crate::builder::StoreBuilder;
-use crate::error::StoreError;
-use crate::event::{Committed, Event, NewEvent};
-use crate::gate::{GateCtx, SchemaGate};
-use crate::id::{Label, Seq, StreamId, Timestamp};
-use crate::sink::{
-    CatchUpFailure, CatchUpReport, ProjectionSink, SinkDispatchFailure, SinkFailureObserver, SinkOp,
-};
+use crate::dispatcher::SinkDispatcher;
+use crate::gate::SchemaGate;
+use crate::id::{Seq, StreamId, Timestamp};
+use crate::sink::{ProjectionSink, SinkFailureObserver};
 use crate::upcaster::Upcaster;
-use crate::state::{empty_state, replay_from};
+use crate::upcasting_backend::UpcastingBackend;
+
+mod labels;
+mod lifecycle;
+mod read;
+mod write;
 
 /// Kind used for the internal event a `revert` writes to the log.
 pub const REVERT_KIND: &str = "reverted";
@@ -368,8 +395,9 @@ pub const REVERT_KIND: &str = "reverted";
 /// state.
 ///
 /// See the "Compaction and history boundary" section in the module-level
-/// rustdoc, and [`StoreError::SeqCompacted`] for the boundary error returned
-/// from [`Store::state_at`] / [`Store::revert`] on pre-boundary seqs.
+/// rustdoc, and [`crate::StoreError::SeqCompacted`] for the boundary error
+/// returned from [`Store::state_at`] / [`Store::revert`] on pre-boundary
+/// seqs.
 pub const SNAPSHOT_KIND: &str = "compacted";
 
 /// Canonical kind for the tombstone event [`Store::delete`] appends.
@@ -434,9 +462,10 @@ pub struct Store {
     events: Arc<dyn EventBackend>,
     cache: Arc<dyn CacheBackend>,
     gates: Vec<Arc<dyn SchemaGate>>,
-    sinks: Vec<Arc<dyn ProjectionSink>>,
-    checkpoints: Arc<Mutex<HashMap<(String, StreamId), Seq>>>,
-    checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
+    /// Sink registry, checkpoint bookkeeping, and failure-observer
+    /// dispatch. See [`crate::dispatcher::SinkDispatcher`] for the full
+    /// responsibility split between it and this facade.
+    dispatcher: Arc<SinkDispatcher>,
     /// Per-stream write lock, keyed on `StreamId`. Serializes the
     /// state-read -> gate -> backend-append -> sink-dispatch critical
     /// section of `append` / `import_event` / `revert` for a single stream,
@@ -447,28 +476,17 @@ pub struct Store {
     ///
     /// Entries are never evicted — long-running processes that write to an
     /// unbounded number of distinct streams will accumulate one entry per
-    /// stream ever seen. This mirrors the existing `checkpoints` map (same
+    /// stream ever seen. This mirrors the dispatcher's checkpoint map (same
     /// trade-off, same justification: the alternative is a correctness bug).
     stream_locks: Arc<StdMutex<HashMap<StreamId, Arc<Mutex<()>>>>>,
-    /// Optional visibility hook — see [`crate::SinkFailureObserver`].
-    /// Invoked from inline dispatch (`commit` after `append`,
-    /// `on_label_set` after `label_set`, `on_label_deleted` after
-    /// `label_delete`) whenever a sink returns `Err`. Dispatch semantics
-    /// themselves (checkpoint parked / label backend already advanced) are
-    /// unchanged.
-    sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
-    /// Sink ids that have completed `catch_up` (or `rebuild`) in this
-    /// `Store` instance. Consulted by [`Store::catch_up`] to decide whether
-    /// a sink that
-    /// [`crate::ProjectionSink::requires_rebuild_on_attach`] must be
-    /// escalated to a `rebuild` — the first `catch_up` in a fresh process
-    /// forces a full replay for such sinks, subsequent calls resume
-    /// normally. Cleared on process restart by construction (in-memory
-    /// only, never persisted).
-    rebuilt_this_process: Arc<StdMutex<HashSet<String>>>,
-    /// Read-time event upcasters — see [`crate::Upcaster`]. Each read
-    /// path in this facade walks the chain in registration order before
-    /// handing events off to replay, sinks, or the caller.
+    /// Read-time event upcasters — see [`crate::Upcaster`]. The chain
+    /// itself is applied by [`crate::upcasting_backend::UpcastingBackend`],
+    /// which `events` is wrapped in (see [`Store::new_inner_full`])
+    /// whenever this vec is non-empty; `events` points straight at the
+    /// real backend otherwise. This copy is retained so the write path
+    /// (`write_event_locked`) can tell whether `events` is wrapped
+    /// without downcasting, and so it can reconstruct the post-commit
+    /// `next` state from the (already-upcasted) committed event's patch.
     upcasters: Vec<Arc<dyn Upcaster>>,
     config: StoreConfig,
 }
@@ -547,7 +565,15 @@ impl Store {
         config: StoreConfig,
         checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
     ) -> Self {
-        Self::new_inner_with_observer(events, cache, gates, sinks, config, checkpoint_backend, None)
+        Self::new_inner_with_observer(
+            events,
+            cache,
+            gates,
+            sinks,
+            config,
+            checkpoint_backend,
+            None,
+        )
     }
 
     /// Inner constructor that also accepts an optional sink failure
@@ -590,58 +616,32 @@ impl Store {
         sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
         upcasters: Vec<Arc<dyn Upcaster>>,
     ) -> Self {
+        // Wrap `events` in `UpcastingBackend` iff there is a chain to
+        // apply — this makes every facade read that goes through
+        // `self.events` (state_at / read / read_by_meta / streams_live /
+        // label_set / materialize_to_sink / catch_up_inner) upcast for
+        // free, with no per-call-site upcast call needed. `upcasters`
+        // itself is retained on `Store` below (unwrapped) so
+        // `write_event_locked` can still branch on "is there a chain at
+        // all" and reconstruct its post-commit `next` state — see that
+        // field's doc comment.
+        let events: Arc<dyn EventBackend> = if upcasters.is_empty() {
+            events
+        } else {
+            Arc::new(UpcastingBackend::new(events, upcasters.clone()))
+        };
         Self {
             events,
             cache,
             gates,
-            sinks,
-            checkpoints: Arc::new(Mutex::new(HashMap::new())),
-            checkpoint_backend,
+            dispatcher: Arc::new(SinkDispatcher::new(
+                sinks,
+                checkpoint_backend,
+                sink_failure_observer,
+            )),
             stream_locks: Arc::new(StdMutex::new(HashMap::new())),
-            sink_failure_observer,
-            rebuilt_this_process: Arc::new(StdMutex::new(HashSet::new())),
             upcasters,
             config,
-        }
-    }
-
-    /// Apply the registered upcaster chain to `event`, in registration
-    /// order. Returns the transformed event; passes through unchanged
-    /// when no upcasters are registered.
-    fn apply_upcasters(&self, mut event: Event) -> Event {
-        for uc in &self.upcasters {
-            event = uc.upcast(event);
-        }
-        event
-    }
-
-    /// Apply the upcaster chain to every event in `events`. Used by every
-    /// internal read path.
-    fn apply_upcasters_all(&self, events: Vec<Event>) -> Vec<Event> {
-        if self.upcasters.is_empty() {
-            return events;
-        }
-        events.into_iter().map(|e| self.apply_upcasters(e)).collect()
-    }
-
-    /// Notify the observer if one is attached; no-op otherwise. Kept small
-    /// enough to inline at each dispatch site without noise.
-    fn notify_sink_failure(
-        &self,
-        sink_id: &str,
-        stream: &StreamId,
-        seq: Option<Seq>,
-        op: SinkOp,
-        error: &StoreError,
-    ) {
-        if let Some(observer) = &self.sink_failure_observer {
-            observer.on_failure(&SinkDispatchFailure {
-                sink_id: sink_id.to_string(),
-                stream: stream.clone(),
-                seq,
-                op,
-                error: error.to_string(),
-            });
         }
     }
 
@@ -653,1077 +653,5 @@ impl Store {
             .entry(stream.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    /// Look up `sink_id`'s checkpoint for `stream`.
-    ///
-    /// Consults the in-memory cache first; on a miss, restores from the
-    /// persisted [`CheckpointBackend`] (if one is configured) instead of
-    /// assuming `Seq::ZERO` — this is what makes checkpoints survive a
-    /// restart. A backend read failure is treated the same as "no
-    /// checkpoint found" (fail open): sinks are contracted to be idempotent
-    /// under redelivery, so the worst case is a redundant re-dispatch on the
-    /// next `catch_up`, never a missed one.
-    async fn checkpoint_get(&self, sink_id: &str, stream: &StreamId) -> Seq {
-        let key = (sink_id.to_string(), stream.clone());
-        {
-            let cps = self.checkpoints.lock().await;
-            if let Some(seq) = cps.get(&key) {
-                return *seq;
-            }
-        }
-        let restored = match &self.checkpoint_backend {
-            Some(backend) => backend
-                .get(sink_id, stream)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(Seq::ZERO),
-            None => Seq::ZERO,
-        };
-        let mut cps = self.checkpoints.lock().await;
-        cps.entry(key).or_insert(restored);
-        restored
-    }
-
-    /// Advance `sink_id`'s checkpoint for `stream` to `seq`.
-    ///
-    /// When a [`CheckpointBackend`] is configured, persists first and only
-    /// updates the in-memory cache on success — returning `false` and
-    /// leaving the in-memory value untouched if persistence fails. This
-    /// keeps memory and backend from drifting apart: a failed persist here
-    /// means the next `catch_up` re-drives from the last *durably* recorded
-    /// position, rather than from a position only this process remembers.
-    async fn checkpoint_advance(&self, sink_id: &str, stream: &StreamId, seq: Seq) -> bool {
-        if let Some(backend) = &self.checkpoint_backend {
-            if backend.put(sink_id, stream, seq).await.is_err() {
-                return false;
-            }
-        }
-        let mut cps = self.checkpoints.lock().await;
-        cps.insert((sink_id.to_string(), stream.clone()), seq);
-        true
-    }
-
-    /// Reset `sink_id`'s checkpoint for `stream` to zero, in memory and
-    /// (best-effort) in the [`CheckpointBackend`].
-    ///
-    /// A failed persist here is not surfaced: the very next successful
-    /// [`Store::checkpoint_advance`] call re-persists the correct seq,
-    /// self-healing the drift. Reset is only ever a prelude to immediately
-    /// driving the sink forward again (see [`Store::rebuild`]), so there is
-    /// no window where a stale persisted value would be read back.
-    async fn checkpoint_reset(&self, sink_id: &str, stream: &StreamId) {
-        {
-            let mut cps = self.checkpoints.lock().await;
-            cps.remove(&(sink_id.to_string(), stream.clone()));
-        }
-        if let Some(backend) = &self.checkpoint_backend {
-            let _ = backend.put(sink_id, stream, Seq::ZERO).await;
-        }
-    }
-
-    /// Append one event to `stream`. Returns the [`Committed`] coordinates
-    /// (`seq` and the `at` the backend stamped) the backend assigned.
-    ///
-    /// Returning `Committed` instead of a bare `Seq` means a caller that
-    /// needs the write's own timestamp (e.g. to echo it back to a client, or
-    /// to key a downstream cache entry) does not have to immediately
-    /// `read(stream, seq, 1)` the event straight back just to learn `at`.
-    ///
-    /// The backend stamps `at` with the wall-clock time of this call — use
-    /// this for ordinary domain writes. See [`Store::import_event`] for the
-    /// historical-timestamp counterpart used by import/migration paths.
-    ///
-    /// Fast path: when no [`SchemaGate`] is registered, `next` is not
-    /// materialized pre-commit. If the assigned `seq` misses the cache stride
-    /// and no [`ProjectionSink`] is registered, `next` is not materialized at
-    /// all. See the crate-level cost-model section for the full breakdown.
-    pub async fn append(
-        &self,
-        stream: &StreamId,
-        kind: &str,
-        patch: json_patch::Patch,
-        meta: Value,
-    ) -> Result<Committed, StoreError> {
-        let lock = self.stream_lock(stream);
-        let _guard = lock.lock().await;
-        self.write_event_locked(stream, kind, patch, meta, WriteMode::Append)
-            .await
-    }
-
-    /// Append `patch` iff the stream's current head matches `expected_head`.
-    ///
-    /// This is the optimistic-concurrency counterpart to [`Store::append`]
-    /// for deployments where multiple writers can touch the same event log —
-    /// e.g. a long-running server sharing an SQLite file with a CLI, or two
-    /// processes coordinating through a common database. The backend runs
-    /// the head check and the insert inside one transaction, so a second
-    /// writer that races us will serialize behind the backend's file lock
-    /// rather than sneak a stale write past the CAS.
-    ///
-    /// `expected_head` semantics:
-    ///
-    /// - [`Seq::ZERO`] means "expect the stream to currently be empty". The
-    ///   internal state materialization skips the log entirely and hands
-    ///   [`crate::state::empty_state`] to the gate.
-    /// - A positive `expected_head` means "expect the head to be exactly
-    ///   this seq". The internal state materialization runs
-    ///   [`Store::state_at`] at `expected_head`; if that read fails because
-    ///   `expected_head` is past the real head (or the stream is empty),
-    ///   the error is remapped to [`StoreError::HeadConflict`] so callers
-    ///   see one uniform failure mode.
-    ///
-    /// Returns [`StoreError::HeadConflict`] when the observed head does not
-    /// match `expected_head` (either at the pre-flight state read above or
-    /// at the atomic backend check). Returns
-    /// [`StoreError::BackendUnsupported`] when the underlying
-    /// [`EventBackend`] has not overridden
-    /// [`EventBackend::append_if_head`] (the default implementation
-    /// declines).
-    ///
-    /// Everything else — gate validation, cache write, sink dispatch — is
-    /// identical to [`Store::append`].
-    pub async fn append_if_head(
-        &self,
-        stream: &StreamId,
-        kind: &str,
-        patch: json_patch::Patch,
-        meta: Value,
-        expected_head: Seq,
-    ) -> Result<Committed, StoreError> {
-        let lock = self.stream_lock(stream);
-        let _guard = lock.lock().await;
-        self.write_event_locked(stream, kind, patch, meta, WriteMode::AppendIfHead(expected_head))
-            .await
-    }
-
-    /// Import one event into `stream`, recording `at` as its time coordinate
-    /// instead of the wall-clock time of this call.
-    ///
-    /// Identical to [`Store::append`] in every other respect — the same
-    /// gates validate the write, the same sinks are dispatched, the same
-    /// cache-stride rule decides whether `next` is materialized. The only
-    /// difference is which [`EventBackend`] method is invoked: `append`
-    /// delegates to [`EventBackend::append`] (backend stamps "now"),
-    /// `import_event` delegates to [`EventBackend::import_event`] (backend
-    /// stamps the supplied `at`). This is the escape hatch for backfilling
-    /// history that already has its own notion of "when" — an import from a
-    /// legacy system, for example — without discarding that timeline.
-    ///
-    /// Use `append` for ordinary domain writes; reach for `import_event` only
-    /// on import/migration paths.
-    ///
-    /// ## `at` is a time coordinate, not an ordering key
-    ///
-    /// Every event carries a time coordinate (`at`) and a log position
-    /// (`seq`). `append` always sets `at` to the wall-clock moment of the
-    /// write; `import_event` lets the caller substitute a different
-    /// coordinate — typically the moment the change happened in the source
-    /// system being migrated in. Either way, **`seq` orders the log; `at`
-    /// never does.**
-    ///
-    /// ## Non-monotonic `at` and [`Store::seq_at_time`]
-    ///
-    /// [`Store::seq_at_time`] answers "the greatest `seq` whose `at` is `<=`
-    /// the given timestamp", which only matches intuition when a stream's
-    /// `at` values are non-decreasing in `seq` order — true automatically for
-    /// a stream written entirely via `append` (wall-clock time only moves
-    /// forward). `import_event` does not enforce that invariant: the
-    /// supplied `at` may be less than, equal to, or greater than the
-    /// timestamp already recorded at the stream's head.
-    ///
-    /// Backfilling into an **empty** stream in chronological source order —
-    /// the typical migration shape — keeps the non-decreasing assumption
-    /// intact by construction, so `seq_at_time` behaves exactly as it would
-    /// for an `append`-only stream. Importing out of order, or mixing
-    /// `import_event` into a stream that already has `append`ed events on a
-    /// different clock, can leave `seq_at_time` answering a query in a way
-    /// that does not match intuition for that stream (backends are not
-    /// required to detect or reject this). Callers who need that guarantee
-    /// should read the current head event (`Store::head` + `Store::read`)
-    /// and compare its `at` before importing.
-    ///
-    /// Returns [`StoreError::BackendUnsupported`] if the underlying
-    /// [`EventBackend`] has not overridden [`EventBackend::import_event`]
-    /// (the default implementation declines).
-    pub async fn import_event(
-        &self,
-        stream: &StreamId,
-        kind: &str,
-        patch: json_patch::Patch,
-        meta: Value,
-        at: Timestamp,
-    ) -> Result<Committed, StoreError> {
-        let lock = self.stream_lock(stream);
-        let _guard = lock.lock().await;
-        self.write_event_locked(stream, kind, patch, meta, WriteMode::Import(at))
-            .await
-    }
-
-    /// Shared write path for [`Store::append`], [`Store::import_event`], and
-    /// [`Store::append_if_head`].
-    ///
-    /// `mode` selects which backend method to invoke:
-    ///
-    /// - [`WriteMode::Append`] → [`EventBackend::append`] (backend stamps
-    ///   "now"),
-    /// - [`WriteMode::Import(at)`][WriteMode::Import] →
-    ///   [`EventBackend::import_event`] (backend stamps the supplied
-    ///   timestamp),
-    /// - [`WriteMode::AppendIfHead(expected_head)`][WriteMode::AppendIfHead]
-    ///   → [`EventBackend::append_if_head`] (backend runs the head check +
-    ///   insert as one transaction; state materialization uses
-    ///   `expected_head` as the caller's assumed current head, mapping
-    ///   [`StoreError::SeqOutOfRange`] / [`StoreError::UnknownStream`] on
-    ///   the state read to [`StoreError::HeadConflict`]).
-    ///
-    /// Every other step — gate validation, `next` materialization, cache
-    /// write, sink dispatch — is identical across the three modes.
-    ///
-    /// Callers must hold `self.stream_lock(stream)` before calling this —
-    /// it assumes exclusive access to `stream`'s write path and does not
-    /// acquire the lock itself, so that [`Store::revert`] can take the lock
-    /// once and cover both its own state reads and this method's body in a
-    /// single critical section.
-    async fn write_event_locked(
-        &self,
-        stream: &StreamId,
-        kind: &str,
-        patch: json_patch::Patch,
-        meta: Value,
-        mode: WriteMode,
-    ) -> Result<Committed, StoreError> {
-        let current = match mode {
-            WriteMode::AppendIfHead(expected_head) if expected_head != Seq::ZERO => {
-                // The caller's assumed current state is state_at(expected_head).
-                // Any mismatch surfaces here as SeqOutOfRange (expected_head is
-                // past the real head) or UnknownStream (expected_head > 0 on
-                // an empty stream); both are the "head moved" case in disguise
-                // — remap to HeadConflict so the caller sees one uniform error.
-                match self.state_at(stream, expected_head).await {
-                    Ok(v) => v,
-                    Err(StoreError::SeqOutOfRange { head, .. }) => {
-                        return Err(StoreError::HeadConflict {
-                            expected: expected_head,
-                            actual: head,
-                        });
-                    }
-                    Err(StoreError::UnknownStream(_)) => {
-                        return Err(StoreError::HeadConflict {
-                            expected: expected_head,
-                            actual: None,
-                        });
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            WriteMode::AppendIfHead(_) => empty_state(),
-            _ => self.state(stream).await?,
-        };
-        let has_gates = !self.gates.is_empty();
-
-        // Pre-commit next materialization is only needed when a gate will
-        // read it. Otherwise defer — post-commit paths (cache put / sink
-        // dispatch) may not need it either.
-        let precomputed_next = if has_gates {
-            let mut next = current.clone();
-            json_patch::patch(&mut next, &patch)
-                .map_err(|e| StoreError::Patch(format!("gate preview: {e}")))?;
-            for g in &self.gates {
-                g.validate(&GateCtx {
-                    stream,
-                    kind,
-                    patch: &patch,
-                    current: &current,
-                    next: &next,
-                })
-                .map_err(StoreError::Schema)?;
-            }
-            Some(next)
-        } else {
-            None
-        };
-
-        // Retain a patch clone only when we might have to reapply post-commit
-        // (no gates but cache/sink paths may still need `next`). `Patch` is
-        // `Vec<PatchOperation>` — cheap to clone relative to the state itself.
-        let patch_for_reapply = if precomputed_next.is_none() {
-            Some(patch.clone())
-        } else {
-            None
-        };
-
-        let rec = NewEvent {
-            kind: kind.to_string(),
-            patch,
-            meta,
-        };
-        let committed = match mode {
-            WriteMode::Append => self.events.append(stream, rec).await?,
-            WriteMode::Import(at) => self.events.import_event(stream, rec, at).await?,
-            WriteMode::AppendIfHead(expected_head) => {
-                self.events.append_if_head(stream, rec, expected_head).await?
-            }
-        };
-        let seq = committed.seq;
-
-        let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
-        let has_upcasters = !self.upcasters.is_empty();
-        let has_sinks = !self.sinks.is_empty();
-
-        // What "next state" to hand downstream (cache put + sink dispatch)
-        // has to match what `state_at` would reconstruct at `seq` — so
-        // when upcasters are registered, materialize `next` from the
-        // *upcasted* patch, not the raw one the backend stored. The raw
-        // fast path is preserved when no upcasters are in play, to keep
-        // the pre-upcaster performance profile intact.
-        let downstream: Option<(Value, Option<Event>)> = if cache_hit || has_sinks {
-            if has_upcasters {
-                // Read the committed event, upcast it, then apply the
-                // upcasted patch to `current` (which is already the
-                // upcasted-shape state, since `self.state` runs through
-                // upcasters too). Fetch the event once and reuse it for
-                // the sink dispatch below.
-                let raw = self.events.read(stream, seq, 1).await?;
-                let ev = self
-                    .apply_upcasters_all(raw)
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        StoreError::Backend(format!(
-                            "post-commit read at seq={} returned nothing",
-                            seq.0
-                        ))
-                    })?;
-                let mut next = current.clone();
-                json_patch::patch(&mut next, &ev.patch).map_err(|e| {
-                    StoreError::Patch(format!("post-commit upcasted reapply: {e}"))
-                })?;
-                Some((next, Some(ev)))
-            } else if let Some(precomputed) = precomputed_next {
-                Some((precomputed, None))
-            } else {
-                let mut n = current.clone();
-                json_patch::patch(&mut n, patch_for_reapply.as_ref().unwrap())
-                    .map_err(|e| StoreError::Patch(format!("post-commit reapply: {e}")))?;
-                Some((n, None))
-            }
-        } else {
-            None
-        };
-
-        if let Some((ref next_state, ref preloaded_event)) = downstream {
-            if cache_hit {
-                self.cache.put(stream, seq, next_state).await?;
-                // Opportunistic bounded pruning when the caller opted in via
-                // `StoreConfig::cache_keep_latest`. The cache is derived
-                // state (see `CacheBackend`); a failed prune here is
-                // silently swallowed — the next cache-stride write retries
-                // and `Store::prune_cache` remains available as a manual
-                // entry point. This never fails the append itself.
-                if let Some(keep) = self.config.cache_keep_latest {
-                    let _ = self.cache.prune(stream, keep).await;
-                }
-            }
-
-            // Post-commit sink dispatch (best-effort; failure leaves checkpoint alone).
-            if has_sinks {
-                // Reuse the event we already fetched (and upcasted) if the
-                // upcaster path took it; otherwise fetch here.
-                let events: Vec<Event> = if let Some(ev) = preloaded_event.clone() {
-                    vec![ev]
-                } else {
-                    let raw = self.events.read(stream, seq, 1).await?;
-                    self.apply_upcasters_all(raw)
-                };
-                if let Some(ev) = events.into_iter().next() {
-                    for sink in &self.sinks {
-                        if !sink.accepts(stream) {
-                            continue;
-                        }
-                        let checkpoint = self.checkpoint_get(sink.id(), stream).await;
-                        // Skip if already past this seq (catch_up ran concurrently).
-                        if seq <= checkpoint {
-                            continue;
-                        }
-                        match sink.commit(stream, seq, next_state, &ev).await {
-                            Ok(()) => {
-                                // Only advance the checkpoint contiguously. If there is
-                                // a gap (an earlier seq failed dispatch), leave the
-                                // checkpoint parked so catch_up will re-drive the gap.
-                                // A failed persist (see `checkpoint_advance`) is
-                                // likewise left parked for catch_up to redrive.
-                                if seq == checkpoint.next() {
-                                    self.checkpoint_advance(sink.id(), stream, seq).await;
-                                }
-                            }
-                            Err(e) => {
-                                // Best-effort dispatch: checkpoint stays put so
-                                // catch_up re-drives this seq. Surface the failure
-                                // through the observer (if attached) so the caller
-                                // can see the sink falling behind without waiting
-                                // for a manual catch_up call.
-                                self.notify_sink_failure(
-                                    sink.id(),
-                                    stream,
-                                    Some(seq),
-                                    SinkOp::Commit,
-                                    &e,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(committed)
-    }
-
-    /// Current state of `stream`. Empty streams yield `Value::Null`.
-    pub async fn state(&self, stream: &StreamId) -> Result<Value, StoreError> {
-        let head = self.events.head(stream).await?;
-        let Some(head) = head else {
-            return Ok(empty_state());
-        };
-        self.state_at(stream, head).await
-    }
-
-    /// State of `stream` at coordinate `at`. Uses cache-nearest + replay.
-    ///
-    /// Returns [`StoreError::SeqCompacted`] when `at` falls strictly before
-    /// this stream's compaction boundary (see [`SNAPSHOT_KIND`] and the
-    /// "Compaction and history boundary" section in the module-level rustdoc):
-    /// the events that would be needed to reconstruct state at `at` have been
-    /// replaced by a snapshot, so the pre-boundary state is no longer
-    /// materially reachable. `state_at(stream, boundary)` itself still works
-    /// — the snapshot event materializes exactly that state — and any seq
-    /// after the boundary replays forward from it as usual.
-    pub async fn state_at(&self, stream: &StreamId, at: Seq) -> Result<Value, StoreError> {
-        let head = self.events.head(stream).await?;
-        match head {
-            None => return Err(StoreError::UnknownStream(stream.clone())),
-            Some(h) if at > h => {
-                return Err(StoreError::SeqOutOfRange {
-                    head: Some(h),
-                    requested: at,
-                })
-            }
-            Some(_) => {}
-        }
-
-        if let Some(boundary) = self.events.compaction_boundary(stream).await? {
-            if at < boundary {
-                return Err(StoreError::SeqCompacted {
-                    boundary,
-                    requested: at,
-                });
-            }
-        }
-
-        let (base_state, from) = match self.cache.nearest(stream, at).await? {
-            Some((seq, state)) => (state, seq.next()),
-            None => (empty_state(), Seq::ZERO.next()),
-        };
-
-        if from > at {
-            return Ok(base_state);
-        }
-        let limit = (at.0 - from.0 + 1) as usize;
-        let events = self.events.read(stream, from, limit).await?;
-        let events = self.apply_upcasters_all(events);
-        // Compaction leaves gaps in the seq sequence — the reader may
-        // legitimately return fewer than `limit` events, or events with
-        // seqs beyond `at` when the earliest event on the stream is a
-        // snapshot at `from > 1`. Trim the replay set to `seq <= at` so
-        // the reconstructed state matches the caller's requested coordinate
-        // regardless of where the compaction boundary sits.
-        let events: Vec<_> = events.into_iter().take_while(|e| e.seq <= at).collect();
-        replay_from(base_state, &events)
-    }
-
-    /// Revert `stream` to the state at `to` by appending the reverse diff as a
-    /// new event. The prior state stays in the log; recovery from mistakes is
-    /// yet another revert.
-    ///
-    /// Equivalent to [`Store::revert_with_meta`] with `extra_meta =
-    /// Value::Null` — the appended event's `meta` is exactly `{"revert_to":
-    /// to}`. See [`Store::revert_with_meta`] if the caller needs to attach
-    /// its own attribution (e.g. a consumer-defined id) to the revert event.
-    ///
-    /// Holds the per-stream write lock across both the `current`/`target`
-    /// reads and the resulting append, so no concurrent write to `stream`
-    /// can land between "diff computed against `current`" and "diff
-    /// appended" — that gap would otherwise let the reverse patch apply on
-    /// top of a `current` that is no longer the stream's real state.
-    pub async fn revert(&self, stream: &StreamId, to: Seq) -> Result<Committed, StoreError> {
-        self.revert_with_meta(stream, to, Value::Null).await
-    }
-
-    /// Revert `stream` to the state at `to`, like [`Store::revert`], but let
-    /// the caller merge its own fields into the appended event's `meta`.
-    ///
-    /// Without this, a consumer whose `meta` schema carries its own
-    /// attribution (e.g. a `node_id`, an actor, a correlation id) has no way
-    /// to express that on a revert — `revert`'s generated `meta` is always
-    /// the fixed shape `{"revert_to": to}`, with nowhere for consumer fields
-    /// to go.
-    ///
-    /// ## Merge semantics
-    ///
-    /// If `extra_meta` is a JSON object, its keys are merged into the
-    /// generated `{"revert_to": to}` meta. `"revert_to"` is a reserved key:
-    /// the generated value always wins, so a same-named key in `extra_meta`
-    /// is silently overwritten rather than causing an error — this mirrors
-    /// how [`Store::append`]'s `meta` argument is opaque to the store (no
-    /// key is otherwise reserved), keeping the one exception explicit here
-    /// rather than failing the call.
-    ///
-    /// If `extra_meta` is anything other than a JSON object — including
-    /// `Value::Null` — it is ignored entirely and the appended event's
-    /// `meta` is exactly `{"revert_to": to}`, same as [`Store::revert`]. This
-    /// method does not validate `extra_meta`'s shape beyond that one
-    /// object/non-object branch; a non-object value is silently dropped, not
-    /// rejected, on the reasoning that a revert should not fail solely
-    /// because the caller's optional attribution was malformed.
-    ///
-    /// See [`Store::revert`]'s rustdoc for the write-lock and history
-    /// guarantees this method also provides — the merge described above is
-    /// the only difference between the two.
-    pub async fn revert_with_meta(
-        &self,
-        stream: &StreamId,
-        to: Seq,
-        extra_meta: Value,
-    ) -> Result<Committed, StoreError> {
-        let lock = self.stream_lock(stream);
-        let _guard = lock.lock().await;
-        let current = self.state(stream).await?;
-        let target = self.state_at(stream, to).await?;
-        let patch = diff(&current, &target);
-
-        let mut meta = match extra_meta {
-            Value::Object(map) => map,
-            _ => Map::new(),
-        };
-        meta.insert("revert_to".to_string(), Value::from(to.0));
-
-        self.write_event_locked(stream, REVERT_KIND, patch, Value::Object(meta), WriteMode::Append)
-            .await
-    }
-
-    /// Mark `stream` as deleted by appending a tombstone event of kind
-    /// [`TOMBSTONE_KIND`].
-    ///
-    /// The tombstone carries an empty patch — the materialized state does not
-    /// change — but the event itself flows through the same write path as
-    /// [`Store::append`]: every registered [`SchemaGate`] validates it, the
-    /// per-stream write lock serializes it, and every accepting
-    /// [`ProjectionSink`] receives it. `meta` is opaque to the store (same
-    /// contract as `append`); pass `Value::Null` (or `Value::Object(Map::new())`)
-    /// when there is nothing to attribute.
-    ///
-    /// This is a *convention*, not a physical removal: history stays
-    /// append-only, `state_at(stream, seq)` for any `seq` before the tombstone
-    /// still reconstructs the pre-delete state, and a further non-tombstone
-    /// [`Store::append`] "revives" the stream (see the "How deletion works"
-    /// section in the module-level rustdoc). Consumers that want to reject
-    /// writes after a tombstone should register a [`crate::KindGate`]
-    /// validator; consumers that want to hide tombstoned streams from a
-    /// listing should use [`Store::streams_live`] or the read-model's
-    /// `live = 1` filter.
-    pub async fn delete(&self, stream: &StreamId, meta: Value) -> Result<Committed, StoreError> {
-        let empty_patch: json_patch::Patch = serde_json::from_value(Value::Array(Vec::new()))
-            .expect("empty JSON array parses as an empty JSON Patch");
-        let lock = self.stream_lock(stream);
-        let _guard = lock.lock().await;
-        self.write_event_locked(stream, TOMBSTONE_KIND, empty_patch, meta, WriteMode::Append)
-            .await
-    }
-
-    /// Enumerate events. See `EventBackend::read`.
-    ///
-    /// Every returned [`Event`] is passed through the registered
-    /// [`Upcaster`] chain before it is handed back to the caller (see the
-    /// "Schema evolution" section in the module-level rustdoc). When no
-    /// upcasters are registered, this is a straight pass-through of the
-    /// backend's response.
-    pub async fn read(
-        &self,
-        stream: &StreamId,
-        from: Seq,
-        limit: usize,
-    ) -> Result<Vec<Event>, StoreError> {
-        let events = self.events.read(stream, from, limit).await?;
-        Ok(self.apply_upcasters_all(events))
-    }
-
-    /// Enumerate events whose top-level `meta[field]` equals `value`. See
-    /// [`EventBackend::read_by_meta`].
-    ///
-    /// The `meta[field] == value` predicate is evaluated against the
-    /// *stored* event (backends with a native `json_extract`-based
-    /// implementation — the SQLite backend here, for one — filter inside
-    /// the backend before any upcaster gets a chance). Once matching
-    /// events have been selected, they are then run through the
-    /// [`Upcaster`] chain the same as [`Store::read`]. Consumers that mix
-    /// schema evolution with `read_by_meta` should keep the meta fields
-    /// they filter on stable across shape changes — see the
-    /// `read_by_meta` caveat in [`crate::Upcaster`]'s module rustdoc.
-    pub async fn read_by_meta(
-        &self,
-        stream: &StreamId,
-        field: &str,
-        value: &Value,
-        from: Seq,
-        limit: usize,
-    ) -> Result<Vec<Event>, StoreError> {
-        let events = self
-            .events
-            .read_by_meta(stream, field, value, from, limit)
-            .await?;
-        Ok(self.apply_upcasters_all(events))
-    }
-
-    /// Current head coordinate of `stream`.
-    pub async fn head(&self, stream: &StreamId) -> Result<Option<Seq>, StoreError> {
-        self.events.head(stream).await
-    }
-
-    /// Prune the cache for `stream`, keeping only the `keep_latest` most
-    /// recent snapshot rows.
-    ///
-    /// The cache is derived state — `Store::state_at` reconstructs any lost
-    /// snapshot from the log by replaying forward from a still-cached
-    /// nearest neighbor — so this operation is always safe: it trades a
-    /// slightly-longer replay on `state_at` for a bounded cache footprint.
-    /// The append-only history on [`crate::EventBackend`] is untouched.
-    ///
-    /// Callers who want pruning to happen automatically after every
-    /// cache-stride write should set [`StoreConfig::cache_keep_latest`] at
-    /// construction; those errors are silently ignored (the next write
-    /// retries). This method is the explicit alternative: run it during
-    /// maintenance windows, or when a long-running stream's cache has
-    /// grown past what a consumer wants to keep on disk.
-    pub async fn prune_cache(
-        &self,
-        stream: &StreamId,
-        keep_latest: usize,
-    ) -> Result<(), StoreError> {
-        self.cache.prune(stream, keep_latest).await
-    }
-
-    /// Greatest `Seq` whose event timestamp is `<= at`.
-    ///
-    /// Useful for wall-clock-anchored operations (e.g. "restore to how the
-    /// document looked at 09:00"). Compose with `state_at` to materialize.
-    pub async fn seq_at_time(
-        &self,
-        stream: &StreamId,
-        at: Timestamp,
-    ) -> Result<Option<Seq>, StoreError> {
-        self.events.seq_at_time(stream, at).await
-    }
-
-    /// Enumerate all streams.
-    pub async fn streams(&self) -> Result<Vec<StreamId>, StoreError> {
-        self.events.streams().await
-    }
-
-    /// Enumerate streams whose most recent event is *not* a tombstone (see
-    /// [`Store::delete`] / [`TOMBSTONE_KIND`]).
-    ///
-    /// Streams whose entire history was appended via non-tombstone kinds are
-    /// included; streams that never received a [`Store::delete`] but did
-    /// receive a subsequent non-tombstone [`Store::append`] after one are
-    /// included too (the tombstone is not the *most recent* event any more).
-    /// Streams with no events at all are excluded — [`Store::streams`] does not
-    /// return them either.
-    ///
-    /// This is the "listing without a read model" path: it walks every stream
-    /// and reads its head event, so cost is O(N) in stream count with one
-    /// additional backend `read` per stream. When a [`crate::ProjectionSink`]
-    /// like `SqliteReadModel` is already materializing a `live` flag, its
-    /// indexed query is cheaper and preferable — this method is the fallback
-    /// for callers that have no read model wired up (or want a live listing
-    /// without depending on one).
-    pub async fn streams_live(&self) -> Result<Vec<StreamId>, StoreError> {
-        let all = self.events.streams().await?;
-        let mut out = Vec::with_capacity(all.len());
-        for stream in all {
-            let Some(head) = self.events.head(&stream).await? else {
-                continue;
-            };
-            let events = self.events.read(&stream, head, 1).await?;
-            let events = self.apply_upcasters_all(events);
-            let is_tombstoned = events.first().is_some_and(|e| e.kind == TOMBSTONE_KIND);
-            if !is_tombstoned {
-                out.push(stream);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Pin `label` on `stream` to `at`.
-    ///
-    /// After the backend records the pin, every registered `ProjectionSink`
-    /// that [`ProjectionSink::accepts`] `stream` receives an `on_label_set`
-    /// notification carrying the freshly materialized state at `at` and the
-    /// [`Event`] the label now points at. Sink failures are best-effort —
-    /// they do not roll back the label change, matching the append dispatch
-    /// policy.
-    ///
-    /// Fetching that event is itself best-effort: the label change has
-    /// already succeeded in the backend by this point, so a failure to read
-    /// the event back (or the read returning nothing, which should not
-    /// happen if `state_at` above just succeeded for the same `at`) is
-    /// swallowed the same way a failing `commit` is — it simply means no
-    /// sink is notified for this call, not that `label_set` itself fails.
-    pub async fn label_set(
-        &self,
-        stream: &StreamId,
-        label: &Label,
-        at: Seq,
-    ) -> Result<(), StoreError> {
-        self.events.label_set(stream, label, at).await?;
-        if !self.sinks.is_empty() {
-            let state = self.state_at(stream, at).await?;
-            let event = self
-                .events
-                .read(stream, at, 1)
-                .await
-                .ok()
-                .and_then(|mut evs| (!evs.is_empty()).then(|| evs.remove(0)))
-                .map(|e| self.apply_upcasters(e));
-            if let Some(event) = event {
-                for sink in &self.sinks {
-                    if !sink.accepts(stream) {
-                        continue;
-                    }
-                    if let Err(e) = sink.on_label_set(stream, label, at, &state, &event).await {
-                        self.notify_sink_failure(sink.id(), stream, Some(at), SinkOp::LabelSet, &e);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve `label` on `stream`.
-    pub async fn label_resolve(&self, stream: &StreamId, label: &Label) -> Result<Seq, StoreError> {
-        self.events
-            .label_resolve(stream, label)
-            .await?
-            .ok_or_else(|| StoreError::UnknownLabel(label.as_str().to_string()))
-    }
-
-    /// Enumerate labels on `stream`.
-    pub async fn labels(&self, stream: &StreamId) -> Result<Vec<(Label, Seq)>, StoreError> {
-        self.events.labels(stream).await
-    }
-
-    /// Delete `label` from `stream`.
-    ///
-    /// Idempotent: deleting a label that is not defined is **not** an error.
-    /// Returns `Ok(true)` when the label existed and was removed, `Ok(false)`
-    /// when it was already absent — mirroring the backend's
-    /// [`EventBackend::label_delete`] contract. Callers that need the strict
-    /// "must have existed" behavior can match on the returned `bool`
-    /// themselves.
-    ///
-    /// After the backend removes the label, every registered
-    /// [`ProjectionSink`] that [`ProjectionSink::accepts`] `stream` receives
-    /// an `on_label_deleted` notification — but only when the label actually
-    /// existed (a no-op delete dispatches nothing, since nothing changed).
-    /// Sink failures are best-effort — matching the dispatch policy of
-    /// [`Store::label_set`] and [`Store::append`], a sink error does not
-    /// roll back the deletion.
-    pub async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
-        let existed = self.events.label_delete(stream, label).await?;
-        if existed && !self.sinks.is_empty() {
-            for sink in &self.sinks {
-                if !sink.accepts(stream) {
-                    continue;
-                }
-                if let Err(e) = sink.on_label_deleted(stream, label).await {
-                    self.notify_sink_failure(sink.id(), stream, None, SinkOp::LabelDeleted, &e);
-                }
-            }
-        }
-        Ok(existed)
-    }
-
-    /// Materialize `stream`'s state at `at` (or the current head when `at`
-    /// is `None`) and hand it to `sink_id` immediately, without waiting for
-    /// [`Store::catch_up`] to drive it.
-    ///
-    /// This is the imperative "dump now" escape hatch: previously the only
-    /// way to force a snapshot out of a sink was to pin a synthetic label
-    /// just to trigger `on_label_set`. Unlike the best-effort dispatch in
-    /// [`Store::append`] and [`Store::label_set`], a failing `commit` here
-    /// is propagated to the caller — an explicit dump is expected to
-    /// succeed or report why it didn't.
-    ///
-    /// Unlike every automatic dispatch path (`append`, `catch_up` /
-    /// `rebuild`, `label_set`, `label_delete`), this call **bypasses**
-    /// [`ProjectionSink::accepts`] — the caller names `sink_id` and `stream`
-    /// explicitly, so the request is assumed to know what it is asking for
-    /// even if the sink would otherwise filter that stream out of its
-    /// automatic traffic.
-    ///
-    /// `at` lets a caller replay an arbitrary point in history to a sink,
-    /// not just the head — useful for backfilling a newly attached sink
-    /// with a historical snapshot without first winding the whole stream
-    /// forward through `catch_up`.
-    ///
-    /// The sink's checkpoint is **not** advanced. `commit` is contracted to
-    /// be idempotent (see [`ProjectionSink`]), so a subsequent `catch_up`
-    /// may re-deliver this same `(stream, seq)` pair; that redelivery is
-    /// harmless under the same contract that makes crash recovery safe.
-    /// Advancing the checkpoint here would risk skipping a gap that
-    /// `catch_up` still needs to fill.
-    ///
-    /// Returns `StoreError::UnknownSink` if `sink_id` is not registered.
-    /// Returns `StoreError::UnknownStream` if `stream` has no events —
-    /// whether `at` was given or resolved from an empty head. When `at` is
-    /// `Some(seq)` beyond the stream's current head, returns
-    /// `StoreError::SeqOutOfRange` (surfaced by [`Store::state_at`]).
-    pub async fn materialize_to_sink(
-        &self,
-        stream: &StreamId,
-        sink_id: &str,
-        at: Option<Seq>,
-    ) -> Result<Seq, StoreError> {
-        let sink = self
-            .sinks
-            .iter()
-            .find(|s| s.id() == sink_id)
-            .cloned()
-            .ok_or_else(|| StoreError::UnknownSink(sink_id.to_string()))?;
-
-        let target = match at {
-            Some(seq) => seq,
-            None => self
-                .events
-                .head(stream)
-                .await?
-                .ok_or_else(|| StoreError::UnknownStream(stream.clone()))?,
-        };
-
-        let state = self.state_at(stream, target).await?;
-        let events = self.events.read(stream, target, 1).await?;
-        let events = self.apply_upcasters_all(events);
-        let event = events
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::UnknownStream(stream.clone()))?;
-
-        sink.commit(stream, target, &state, &event).await?;
-        Ok(target)
-    }
-
-    /// Drive `sink_id` forward from its checkpoint to head on every known
-    /// stream. On success the checkpoint advances; on failure it stays put.
-    ///
-    /// The first `catch_up` in this `Store` instance for a sink whose
-    /// [`ProjectionSink::requires_rebuild_on_attach`] returns `true` is
-    /// silently escalated to [`Store::rebuild`] — the sink's in-memory
-    /// state is empty in a fresh process, and resuming from the persisted
-    /// checkpoint alone would silently drop every stream whose head is
-    /// already past that checkpoint. See the trait method's rustdoc for
-    /// the shape of that failure mode. Subsequent `catch_up` calls to the
-    /// same sink id in the same instance behave normally.
-    pub async fn catch_up(&self, sink_id: &str) -> Result<CatchUpReport, StoreError> {
-        let needs_rebuild_escalation = self
-            .sinks
-            .iter()
-            .find(|s| s.id() == sink_id)
-            .map(|s| s.requires_rebuild_on_attach())
-            .unwrap_or(false)
-            && !self.has_been_rebuilt_this_process(sink_id);
-        let reset = needs_rebuild_escalation;
-        let report = self.catch_up_inner(sink_id, reset).await?;
-        // Record success — whether we ran a plain catch_up or an escalated
-        // rebuild — so we do not re-escalate on the next call.
-        self.mark_rebuilt_this_process(sink_id);
-        Ok(report)
-    }
-
-    /// Reset `sink_id`'s checkpoint to zero on every stream, then drive it
-    /// forward. Equivalent to `catch_up` after checkpoint reset — no special
-    /// rebuild API is needed at the backend level.
-    pub async fn rebuild(&self, sink_id: &str) -> Result<CatchUpReport, StoreError> {
-        let report = self.catch_up_inner(sink_id, true).await?;
-        // An explicit rebuild also satisfies the "must rebuild once per
-        // process" contract, so a subsequent `catch_up` for the same sink
-        // id will not re-escalate.
-        self.mark_rebuilt_this_process(sink_id);
-        Ok(report)
-    }
-
-    /// Whether `sink_id` has already completed a `catch_up` or `rebuild`
-    /// in this `Store` instance. Consulted only by
-    /// [`Store::catch_up`]'s auto-rebuild escalation path.
-    fn has_been_rebuilt_this_process(&self, sink_id: &str) -> bool {
-        let guard = self
-            .rebuilt_this_process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.contains(sink_id)
-    }
-
-    /// Mark `sink_id` as having completed at least one full `catch_up` or
-    /// `rebuild` cycle in this instance, so future `catch_up` calls skip
-    /// the auto-rebuild escalation.
-    fn mark_rebuilt_this_process(&self, sink_id: &str) {
-        let mut guard = self
-            .rebuilt_this_process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(sink_id.to_string());
-    }
-
-    /// Drive `sink_id` forward on every stream, isolating failures per
-    /// stream rather than aborting the whole call on the first one.
-    ///
-    /// A failing `commit` (or a failed checkpoint persist — see
-    /// [`Store::checkpoint_advance`]) halts catch-up for *that stream only*:
-    /// order within a stream must be preserved, so every remaining event on
-    /// the failed stream is counted in [`CatchUpReport::skipped`] rather
-    /// than applied out of order, and one [`CatchUpFailure`] is recorded.
-    /// Every other stream is still driven to completion in the same call.
-    async fn catch_up_inner(
-        &self,
-        sink_id: &str,
-        reset: bool,
-    ) -> Result<CatchUpReport, StoreError> {
-        let Some(sink) = self.sinks.iter().find(|s| s.id() == sink_id).cloned() else {
-            return Ok(CatchUpReport::EMPTY);
-        };
-        let streams = self.events.streams().await?;
-        let mut report = CatchUpReport::EMPTY;
-
-        for stream in streams {
-            // A stream this sink does not accept is not this sink's concern
-            // at all: no checkpoint reset, no advance, and no contribution
-            // to `applied` / `skipped` / `failed` — counting it as
-            // "skipped" would imply it was owed a dispatch it never was.
-            if !sink.accepts(&stream) {
-                continue;
-            }
-            if reset {
-                self.checkpoint_reset(sink_id, &stream).await;
-            }
-
-            let head = match self.events.head(&stream).await? {
-                Some(h) => h,
-                None => continue,
-            };
-            let mut cursor = self.checkpoint_get(sink_id, &stream).await;
-            let mut stream_failed = false;
-
-            // Bootstrap the running state *once* at `cursor` and fold each
-            // event's patch onto it forward, instead of re-materializing
-            // state via `state_at` for every event. `state_at` costs a
-            // cache-nearest lookup + a replay of events since that cache
-            // stride; running it once per event turned catch_up over N
-            // events into ~O(N * stride) patch applications. Threading one
-            // running state through the batch loop below drops that to
-            // exactly N patch applications total (plus one bootstrap).
-            let mut running_state: Option<Value> = None;
-
-            while cursor < head && !stream_failed {
-                let from = cursor.next();
-                let events = self.events.read(&stream, from, 32).await?;
-                let events = self.apply_upcasters_all(events);
-                if events.is_empty() {
-                    break;
-                }
-                for ev in events {
-                    // Lazy bootstrap: only pay for `state_at` when we're
-                    // about to hand the sink its first event of this call.
-                    // Streams with an already-at-head checkpoint never
-                    // reach here, so an empty catch_up is O(1) per stream.
-                    let state = match running_state.take() {
-                        Some(mut s) => {
-                            if let Err(e) = json_patch::patch(&mut s, &ev.patch) {
-                                // A patch that fails to apply here — after
-                                // the event was already durably committed
-                                // — is a corruption signal on the log, not
-                                // a plausible operational failure. Report
-                                // it against this stream and halt catch_up
-                                // for it: continuing would apply
-                                // subsequent patches on top of a stale /
-                                // partially-mutated state and dispatch
-                                // wrong `state` values to the sink.
-                                let msg = format!("patch apply seq={}: {}", ev.seq.0, e);
-                                report.failed += 1;
-                                report.failures.push(CatchUpFailure {
-                                    stream: stream.clone(),
-                                    sink_id: sink_id.to_string(),
-                                    message: msg,
-                                });
-                                report.skipped += (head.0 - ev.seq.0) as usize;
-                                stream_failed = true;
-                                break;
-                            }
-                            s
-                        }
-                        None => {
-                            // No running state yet: rebuild it as of the
-                            // event we're about to dispatch. Cache-nearest
-                            // + replay does this cheaply when the cache
-                            // stride has ever seen a snapshot near
-                            // `ev.seq`; on a rebuild with reset=true and
-                            // an empty cache it falls back to a full
-                            // replay from Seq(1), which is fine on the
-                            // *first* event of the stream but exactly the
-                            // cost the running-state carry avoids on
-                            // every subsequent event.
-                            self.state_at(&stream, ev.seq).await?
-                        }
-                    };
-                    match sink.commit(&stream, ev.seq, &state, &ev).await {
-                        Ok(()) => {
-                            if self.checkpoint_advance(sink_id, &stream, ev.seq).await {
-                                report.applied += 1;
-                                cursor = ev.seq;
-                                // Carry state to the next iteration
-                                // instead of re-materializing.
-                                running_state = Some(state);
-                            } else {
-                                report.failed += 1;
-                                report.failures.push(CatchUpFailure {
-                                    stream: stream.clone(),
-                                    sink_id: sink_id.to_string(),
-                                    message: "checkpoint persistence failed".to_string(),
-                                });
-                                report.skipped += (head.0 - ev.seq.0) as usize;
-                                stream_failed = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            report.failed += 1;
-                            report.failures.push(CatchUpFailure {
-                                stream: stream.clone(),
-                                sink_id: sink_id.to_string(),
-                                message: e.to_string(),
-                            });
-                            // Every event after this one on `stream` is
-                            // un-processed, not just un-counted — order must
-                            // be preserved so we cannot skip ahead to a
-                            // later seq while this one is unacknowledged.
-                            report.skipped += (head.0 - ev.seq.0) as usize;
-                            stream_failed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(report)
     }
 }

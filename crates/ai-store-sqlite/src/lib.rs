@@ -147,6 +147,7 @@ mod backend;
 mod driver;
 pub mod maintenance;
 mod migration;
+mod query;
 pub mod read_model;
 mod store;
 

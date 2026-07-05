@@ -26,6 +26,7 @@
 
 mod backend;
 mod builder;
+mod dispatcher;
 mod error;
 mod event;
 mod facade;
@@ -36,6 +37,7 @@ pub mod patch;
 mod sink;
 mod state;
 mod upcaster;
+mod upcasting_backend;
 
 pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
 pub use builder::StoreBuilder;
