@@ -159,6 +159,56 @@
 //! Archived exports of the compacted-away events and policy-driven retention
 //! that drives when compaction runs are out of scope here and tracked as
 //! Phase 2 / Phase 3 follow-ups.
+//!
+//! ## Concurrency model
+//!
+//! `Store` guarantees different amounts of isolation depending on whether
+//! writers share only a process, or share a database file across processes.
+//!
+//! ### Within one process (single `Store` instance)
+//!
+//! [`Store::append`] / [`Store::import_event`] / [`Store::revert`] /
+//! [`Store::delete`] each acquire the [`Store::stream_lock`] entry keyed on
+//! the target `StreamId` (a per-stream `tokio::Mutex`) before running the
+//! state read + gate validation + backend append + cache write + sink
+//! dispatch. Writes to the *same* stream from concurrent tasks on the same
+//! `Store` are serialized end-to-end by that lock, so a
+//! [`SchemaGate`] enforcing a postcondition on `next` never sees an
+//! intermediate state produced by another writer. Writes to *different*
+//! streams remain fully concurrent (the lock is per-`StreamId`, not global).
+//!
+//! ### Across processes (or across `Store` instances on one file)
+//!
+//! The per-stream lock is a process-local `tokio::Mutex` — it does not
+//! reach a second process, nor a second `Store` instance in this process
+//! pointing at the same database file. In that shape, [`Store::append`]
+//! offers only best-effort isolation:
+//!
+//! - The backend still assigns a gap-free monotonic `Seq` (the SQLite
+//!   backend does its `MAX(seq) + 1` allocation inside a `BEGIN IMMEDIATE`
+//!   transaction), so two concurrent `append` calls never produce
+//!   duplicate seqs.
+//! - But a [`SchemaGate`] validating against `current` in process A can
+//!   have its precondition invalidated by a write from process B that
+//!   lands between A's state read and A's own backend append. In this
+//!   deployment shape, `SchemaGate` is a validation aid, not a hard
+//!   invariant.
+//!
+//! [`Store::append_if_head`] is the escape hatch for that case: it hands
+//! the caller's expected head down to the backend, which runs the head
+//! check and the insert as a single transaction. A racing writer either
+//! commits first (and this call returns
+//! [`crate::StoreError::HeadConflict`]) or waits behind the file lock
+//! until this call finishes — either way the invariant holds. Callers who
+//! know their deployment has one process writing to the file can keep
+//! using `append` unchanged; callers who cannot make that assumption
+//! should reach for `append_if_head`.
+//!
+//! Backends that do not implement head-conditional append (the trait's
+//! default returns [`crate::StoreError::BackendUnsupported`]) simply do
+//! not support this pattern. The bundled `ai-store-sqlite` backend
+//! overrides it; `ai-store-mem` intentionally does not, since a single
+//! in-memory `Store` has no cross-process concurrency to guard against.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -208,6 +258,23 @@ pub const SNAPSHOT_KIND: &str = "compacted";
 /// rather than a per-consumer string. See the "How deletion works" section in
 /// the module-level rustdoc.
 pub const TOMBSTONE_KIND: &str = "tombstoned";
+
+/// Which backend write method the shared `write_event_locked` path dispatches
+/// to. Kept private — `Store` maps its public methods
+/// ([`Store::append`] / [`Store::import_event`] / [`Store::append_if_head`] /
+/// [`Store::revert_with_meta`]) to the appropriate variant.
+enum WriteMode {
+    /// Ordinary append. Backend stamps wall-clock `at`.
+    Append,
+    /// Historical import. Backend stamps the supplied timestamp instead of
+    /// "now".
+    Import(Timestamp),
+    /// Optimistic-concurrency append. Backend runs the head check + insert
+    /// as one transaction and returns [`StoreError::HeadConflict`] on
+    /// mismatch. `expected_head == Seq::ZERO` means "expect the stream to
+    /// currently be empty".
+    AppendIfHead(Seq),
+}
 
 /// Configuration knobs for a `Store` instance.
 #[derive(Debug, Clone)]
@@ -436,7 +503,53 @@ impl Store {
     ) -> Result<Committed, StoreError> {
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
-        self.write_event_locked(stream, kind, patch, meta, None)
+        self.write_event_locked(stream, kind, patch, meta, WriteMode::Append)
+            .await
+    }
+
+    /// Append `patch` iff the stream's current head matches `expected_head`.
+    ///
+    /// This is the optimistic-concurrency counterpart to [`Store::append`]
+    /// for deployments where multiple writers can touch the same event log —
+    /// e.g. a long-running server sharing an SQLite file with a CLI, or two
+    /// processes coordinating through a common database. The backend runs
+    /// the head check and the insert inside one transaction, so a second
+    /// writer that races us will serialize behind the backend's file lock
+    /// rather than sneak a stale write past the CAS.
+    ///
+    /// `expected_head` semantics:
+    ///
+    /// - [`Seq::ZERO`] means "expect the stream to currently be empty". The
+    ///   internal state materialization skips the log entirely and hands
+    ///   [`crate::state::empty_state`] to the gate.
+    /// - A positive `expected_head` means "expect the head to be exactly
+    ///   this seq". The internal state materialization runs
+    ///   [`Store::state_at`] at `expected_head`; if that read fails because
+    ///   `expected_head` is past the real head (or the stream is empty),
+    ///   the error is remapped to [`StoreError::HeadConflict`] so callers
+    ///   see one uniform failure mode.
+    ///
+    /// Returns [`StoreError::HeadConflict`] when the observed head does not
+    /// match `expected_head` (either at the pre-flight state read above or
+    /// at the atomic backend check). Returns
+    /// [`StoreError::BackendUnsupported`] when the underlying
+    /// [`EventBackend`] has not overridden
+    /// [`EventBackend::append_if_head`] (the default implementation
+    /// declines).
+    ///
+    /// Everything else — gate validation, cache write, sink dispatch — is
+    /// identical to [`Store::append`].
+    pub async fn append_if_head(
+        &self,
+        stream: &StreamId,
+        kind: &str,
+        patch: json_patch::Patch,
+        meta: Value,
+        expected_head: Seq,
+    ) -> Result<Committed, StoreError> {
+        let lock = self.stream_lock(stream);
+        let _guard = lock.lock().await;
+        self.write_event_locked(stream, kind, patch, meta, WriteMode::AppendIfHead(expected_head))
             .await
     }
 
@@ -499,17 +612,29 @@ impl Store {
     ) -> Result<Committed, StoreError> {
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
-        self.write_event_locked(stream, kind, patch, meta, Some(at))
+        self.write_event_locked(stream, kind, patch, meta, WriteMode::Import(at))
             .await
     }
 
-    /// Shared write path for [`Store::append`] and [`Store::import_event`].
+    /// Shared write path for [`Store::append`], [`Store::import_event`], and
+    /// [`Store::append_if_head`].
     ///
-    /// `at = None` delegates to [`EventBackend::append`] (backend stamps
-    /// "now"); `at = Some(_)` delegates to [`EventBackend::import_event`]
-    /// (backend stamps the supplied timestamp). Every other step — gate
-    /// validation, `next` materialization, cache write, sink dispatch — is
-    /// identical between the two callers.
+    /// `mode` selects which backend method to invoke:
+    ///
+    /// - [`WriteMode::Append`] → [`EventBackend::append`] (backend stamps
+    ///   "now"),
+    /// - [`WriteMode::Import(at)`][WriteMode::Import] →
+    ///   [`EventBackend::import_event`] (backend stamps the supplied
+    ///   timestamp),
+    /// - [`WriteMode::AppendIfHead(expected_head)`][WriteMode::AppendIfHead]
+    ///   → [`EventBackend::append_if_head`] (backend runs the head check +
+    ///   insert as one transaction; state materialization uses
+    ///   `expected_head` as the caller's assumed current head, mapping
+    ///   [`StoreError::SeqOutOfRange`] / [`StoreError::UnknownStream`] on
+    ///   the state read to [`StoreError::HeadConflict`]).
+    ///
+    /// Every other step — gate validation, `next` materialization, cache
+    /// write, sink dispatch — is identical across the three modes.
     ///
     /// Callers must hold `self.stream_lock(stream)` before calling this —
     /// it assumes exclusive access to `stream`'s write path and does not
@@ -522,9 +647,35 @@ impl Store {
         kind: &str,
         patch: json_patch::Patch,
         meta: Value,
-        at: Option<Timestamp>,
+        mode: WriteMode,
     ) -> Result<Committed, StoreError> {
-        let current = self.state(stream).await?;
+        let current = match mode {
+            WriteMode::AppendIfHead(expected_head) if expected_head != Seq::ZERO => {
+                // The caller's assumed current state is state_at(expected_head).
+                // Any mismatch surfaces here as SeqOutOfRange (expected_head is
+                // past the real head) or UnknownStream (expected_head > 0 on
+                // an empty stream); both are the "head moved" case in disguise
+                // — remap to HeadConflict so the caller sees one uniform error.
+                match self.state_at(stream, expected_head).await {
+                    Ok(v) => v,
+                    Err(StoreError::SeqOutOfRange { head, .. }) => {
+                        return Err(StoreError::HeadConflict {
+                            expected: expected_head,
+                            actual: head,
+                        });
+                    }
+                    Err(StoreError::UnknownStream(_)) => {
+                        return Err(StoreError::HeadConflict {
+                            expected: expected_head,
+                            actual: None,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            WriteMode::AppendIfHead(_) => empty_state(),
+            _ => self.state(stream).await?,
+        };
         let has_gates = !self.gates.is_empty();
 
         // Pre-commit next materialization is only needed when a gate will
@@ -563,9 +714,12 @@ impl Store {
             patch,
             meta,
         };
-        let committed = match at {
-            Some(at) => self.events.import_event(stream, rec, at).await?,
-            None => self.events.append(stream, rec).await?,
+        let committed = match mode {
+            WriteMode::Append => self.events.append(stream, rec).await?,
+            WriteMode::Import(at) => self.events.import_event(stream, rec, at).await?,
+            WriteMode::AppendIfHead(expected_head) => {
+                self.events.append_if_head(stream, rec, expected_head).await?
+            }
         };
         let seq = committed.seq;
 
@@ -747,7 +901,7 @@ impl Store {
         };
         meta.insert("revert_to".to_string(), Value::from(to.0));
 
-        self.write_event_locked(stream, REVERT_KIND, patch, Value::Object(meta), None)
+        self.write_event_locked(stream, REVERT_KIND, patch, Value::Object(meta), WriteMode::Append)
             .await
     }
 
@@ -776,7 +930,7 @@ impl Store {
             .expect("empty JSON array parses as an empty JSON Patch");
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
-        self.write_event_locked(stream, TOMBSTONE_KIND, empty_patch, meta, None)
+        self.write_event_locked(stream, TOMBSTONE_KIND, empty_patch, meta, WriteMode::Append)
             .await
     }
 

@@ -17,13 +17,25 @@ use crate::migration;
 
 /// Startup PRAGMAs. Deliberately kept out of `migration::MIGRATIONS`:
 /// `journal_mode` in particular cannot be changed inside a transaction, and
-/// all three are connection-scoped settings rather than schema state, so
-/// they are re-applied on every open (autocommit, ahead of migrations)
-/// instead of being tracked by `PRAGMA user_version`.
+/// all four are connection-scoped settings rather than schema state, so they
+/// are re-applied on every open (autocommit, ahead of migrations) instead of
+/// being tracked by `PRAGMA user_version`.
+///
+/// `busy_timeout = 5000` (5 s) matters most in multi-writer / multi-process
+/// deployments — a second connection that hits an in-progress writer's
+/// lock waits up to five seconds for the lock to clear rather than
+/// surfacing `SQLITE_BUSY` immediately. SQLite's default is 0 (fail on
+/// first contention); 5 s absorbs realistic local-IO stalls (fsync, a
+/// concurrent maintenance transaction) while letting a genuine deadlock
+/// surface promptly. Consumers that need a different value can override
+/// this by opening the database themselves and re-issuing the PRAGMA before
+/// handing the connection off; a first-class knob on `SqliteBackends` is a
+/// carry (see the concurrency section in the crate-level rustdoc).
 const STARTUP_PRAGMAS: &str = r#"
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous  = NORMAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
 "#;
 
 /// `init` closure passed to `AsyncIsle::spawn` / `open_in_memory`: applies

@@ -65,6 +65,42 @@ pub trait EventBackend: Send + Sync {
         Err(StoreError::BackendUnsupported("import_event".to_string()))
     }
 
+    /// Append `rec` iff the stream's current head matches `expected_head`,
+    /// as a single atomic backend transaction.
+    ///
+    /// This is the optimistic-concurrency counterpart to
+    /// [`EventBackend::append`]: instead of assigning the next gap-free
+    /// monotonic `Seq` unconditionally, the backend reads the head *inside*
+    /// its append transaction and rejects the write with
+    /// [`StoreError::HeadConflict`] if the observed head is not
+    /// `expected_head`. Because the head read and the insert share one
+    /// transaction, this is safe across processes — a second writer that
+    /// interleaves between the read and the insert serializes behind SQLite's
+    /// (or the equivalent backend's) file lock rather than sneaking a stale
+    /// write past the CAS.
+    ///
+    /// `expected_head` uses [`Seq::ZERO`] to mean "expect the stream to
+    /// currently be empty". Non-zero `expected_head` means "expect the head
+    /// to be exactly this seq". The `Some(actual)` in the returned
+    /// `HeadConflict` reports what the backend observed instead (or `None`
+    /// when the observed stream was empty).
+    ///
+    /// The default implementation returns
+    /// [`StoreError::BackendUnsupported`] so backends that do not (and
+    /// cannot cheaply) support atomic head reads keep compiling. The
+    /// SQLite backend shipped in this workspace overrides it.
+    async fn append_if_head(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        expected_head: Seq,
+    ) -> Result<Committed, StoreError> {
+        let _ = (stream, rec, expected_head);
+        Err(StoreError::BackendUnsupported(
+            "append_if_head".to_string(),
+        ))
+    }
+
     /// Read events in `[from, from + limit)` order.
     ///
     /// If `from` is greater than the head, returns an empty vector.

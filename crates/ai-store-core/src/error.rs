@@ -61,6 +61,25 @@ pub enum StoreError {
     #[error("unknown sink: {0}")]
     UnknownSink(String),
 
+    /// Optimistic-concurrency append rejected: the stream's head moved
+    /// between the caller's expectation and the backend's atomic check.
+    ///
+    /// Surfaced from [`crate::Store::append_if_head`] (and the underlying
+    /// [`crate::EventBackend::append_if_head`]) when a compare-and-swap
+    /// append cannot proceed because the stream already has more (or fewer)
+    /// events than the caller assumed. `expected` is the head the caller
+    /// passed; `actual` is the head the backend observed inside the same
+    /// transaction it would have appended in (`None` if the stream is
+    /// empty). The caller can retry after reconstructing state at `actual`
+    /// or surface the conflict to the domain.
+    #[error("head conflict: expected={expected:?}, actual={actual:?}")]
+    HeadConflict {
+        /// The head coordinate the caller expected before appending.
+        expected: Seq,
+        /// The head coordinate the backend actually observed.
+        actual: Option<Seq>,
+    },
+
     /// The backend does not support this operation.
     ///
     /// Returned by the default implementation of

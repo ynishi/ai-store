@@ -88,6 +88,36 @@
 //! WAL journal mode is enabled at open so multi-reader consumers can proceed
 //! concurrently with the writer.
 //!
+//! ## Concurrency and multi-process writers
+//!
+//! The startup PRAGMA block also sets `busy_timeout = 5000` (5 s), so a
+//! second connection — in this process or another one — that hits the
+//! writer's file lock waits up to five seconds for it to clear rather than
+//! surfacing `SQLITE_BUSY` immediately. That absorbs realistic local-IO
+//! stalls (fsync, a concurrent maintenance transaction) without hiding a
+//! genuine deadlock. A first-class knob to override the value is a carry
+//! (see the concurrency section in [`ai_store_core::Store`]'s module-level
+//! rustdoc); callers who need a different timeout today can open the
+//! database themselves, re-issue `PRAGMA busy_timeout = N` on the raw
+//! connection, and hand the connection off to [`rusqlite_isle`].
+//!
+//! Optimistic concurrency (compare-and-swap on the stream head) is
+//! implemented at the backend layer via
+//! [`ai_store_core::EventBackend::append_if_head`] and surfaced through
+//! [`ai_store_core::Store::append_if_head`]. The SQLite backend runs the
+//! head read and the insert inside a single `BEGIN IMMEDIATE` transaction,
+//! so a racing writer from a second connection either commits first (and
+//! the losing side returns [`ai_store_core::StoreError::HeadConflict`]) or
+//! waits behind SQLite's file lock — the head-CAS invariant holds across
+//! processes without any extra out-of-band coordination.
+//!
+//! Callers whose deployment has one process writing to the database file
+//! at a time can keep using [`ai_store_core::Store::append`] unchanged.
+//! Callers who cannot make that assumption (e.g. a long-running server
+//! sharing a file with a CLI) should reach for `append_if_head` on writes
+//! whose correctness depends on the reader's view of the stream still
+//! being current at commit time.
+//!
 //! ## Shortest path: `SqliteStore`
 //!
 //! Assembling `events`/`cache`/`checkpoints`/`driver` by hand from

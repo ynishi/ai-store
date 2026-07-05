@@ -178,6 +178,75 @@ impl EventBackend for SqliteEventBackend {
         self.insert_event(stream, rec, at.0).await
     }
 
+    async fn append_if_head(
+        &self,
+        stream: &StreamId,
+        rec: NewEvent,
+        expected_head: Seq,
+    ) -> Result<Committed, StoreError> {
+        // Head read and insert must happen inside one transaction — that is
+        // exactly the invariant this method provides over `append`. A second
+        // connection (in this process or another) that races us will
+        // serialize behind SQLite's file lock rather than observe an
+        // intermediate state where the head has been read but not yet moved.
+        let stream_name = stream.as_str().to_string();
+        let patch_json = serde_json::to_string(&rec.patch).map_err(to_store_err)?;
+        let meta_json = serde_json::to_string(&rec.meta).map_err(to_store_err)?;
+        let kind = rec.kind;
+        let at_ms = Timestamp::now().0;
+        let expected = expected_head.0 as i64;
+
+        // Signal shape carried out of the SQLite thread: `Ok(seq)` on
+        // committed CAS, `Err(observed_head_opt)` on head mismatch. Keeps
+        // rusqlite's error channel free for real DB errors.
+        enum CasOutcome {
+            Committed(u64),
+            Conflict(Option<i64>),
+        }
+
+        let outcome: CasOutcome = self
+            .isle
+            .call(move |conn| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let observed: Option<i64> = tx
+                    .query_row(
+                        "SELECT MAX(seq) FROM events WHERE stream = ?1",
+                        params![stream_name],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let observed_seq = observed.unwrap_or(0);
+                if observed_seq != expected {
+                    // Roll back the (empty-so-far) tx implicitly by dropping
+                    // it; no writes were attempted so nothing to undo.
+                    return Ok(CasOutcome::Conflict(observed));
+                }
+                let next_seq = expected + 1;
+                tx.execute(
+                    "INSERT INTO events (stream, seq, kind, patch, meta, at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![stream_name, next_seq, kind, patch_json, meta_json, at_ms],
+                )?;
+                tx.commit()?;
+                Ok(CasOutcome::Committed(next_seq as u64))
+            })
+            .await
+            .map_err(to_store_err)?;
+
+        match outcome {
+            CasOutcome::Committed(seq) => Ok(Committed {
+                seq: Seq(seq),
+                at: Timestamp(at_ms),
+            }),
+            CasOutcome::Conflict(actual) => Err(StoreError::HeadConflict {
+                expected: expected_head,
+                actual: actual.map(|s| Seq(s as u64)),
+            }),
+        }
+    }
+
     async fn read(
         &self,
         stream: &StreamId,
