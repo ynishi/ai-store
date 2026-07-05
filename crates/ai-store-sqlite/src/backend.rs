@@ -355,6 +355,43 @@ impl EventBackend for SqliteEventBackend {
         Ok(rows.into_iter().map(StreamId).collect())
     }
 
+    async fn compaction_boundary(
+        &self,
+        stream: &StreamId,
+    ) -> Result<Option<Seq>, StoreError> {
+        // Compaction (see `crate::maintenance::SqliteMaintenance`) always
+        // leaves the snapshot as the earliest event on the stream: the
+        // maintenance transaction deletes every row at seq <= up_to_seq and
+        // then re-inserts one row of kind SNAPSHOT_KIND at seq=up_to_seq.
+        // The stream is compacted iff its earliest event carries that kind —
+        // "MIN(seq) > 1" alone would be ambiguous (a stream that never used
+        // seq 1 doesn't exist in the current API, but keying on the kind is
+        // both narrower and self-describing).
+        use ai_store_core::SNAPSHOT_KIND;
+        let stream_name = stream.as_str().to_string();
+        let earliest: Option<(i64, String)> = self
+            .isle
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT seq, kind FROM events \
+                     WHERE stream = ?1 \
+                     ORDER BY seq ASC LIMIT 1",
+                    params![stream_name],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()
+            })
+            .await
+            .map_err(to_store_err)?;
+        Ok(earliest.and_then(|(seq, kind)| {
+            if kind == SNAPSHOT_KIND {
+                Some(Seq(seq as u64))
+            } else {
+                None
+            }
+        }))
+    }
+
     async fn label_set(&self, stream: &StreamId, label: &Label, at: Seq) -> Result<(), StoreError> {
         let stream_name = stream.as_str().to_string();
         let label_name = label.as_str().to_string();

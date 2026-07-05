@@ -36,6 +36,23 @@ pub enum StoreError {
         requested: Seq,
     },
 
+    /// Requested coordinate falls before the compaction boundary of this
+    /// stream — the events that would be needed to reconstruct that state
+    /// have been replaced by a snapshot at `boundary`, so the state is no
+    /// longer materially reachable.
+    ///
+    /// Callers can still reach `boundary` itself (the snapshot event
+    /// materializes exactly that state) and any seq strictly after it. See
+    /// [`crate::SNAPSHOT_KIND`] and the "Compaction and history boundary"
+    /// section in `Store`'s module-level rustdoc.
+    #[error("seq below compaction boundary: stream compacted to {boundary:?}, requested={requested:?}")]
+    SeqCompacted {
+        /// Earliest seq still materially reachable (the snapshot event's seq).
+        boundary: Seq,
+        /// The seq that was requested.
+        requested: Seq,
+    },
+
     /// Requested label is not defined on the stream.
     #[error("unknown label: {0}")]
     UnknownLabel(String),

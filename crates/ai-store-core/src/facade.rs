@@ -119,9 +119,46 @@
 //! for a `seq` *before* the tombstone still reconstructs the pre-delete state
 //! bit-for-bit, and [`Store::revert`] to that `seq` produces a new event whose
 //! reverse patch is empty (the tombstone did not change state) — the "undo"
-//! for a delete is really the *next* non-tombstone append. Physical removal of
-//! events (log compaction / retention) is a separate concern tracked in the
-//! retention issue and is deliberately out of scope here.
+//! for a delete is really the *next* non-tombstone append. Physical removal
+//! of events is a separate concern; see "Compaction and history boundary"
+//! below.
+//!
+//! ## Compaction and history boundary
+//!
+//! Deletion above is a logical marker — nothing shrinks on disk. Backend-side
+//! *compaction* is the escape hatch for streams whose history is not needed
+//! to a certain seq any more: a maintenance API on the backend
+//! (`ai_store_sqlite::SqliteMaintenance::compact_stream` for the bundled
+//! SQLite backend) atomically replaces a stream's event prefix
+//! `[Seq(1) .. boundary]` with a single snapshot event of kind
+//! [`SNAPSHOT_KIND`] at `boundary`, whose patch is an `add "/"` that
+//! materializes the pre-compaction state directly. `Store::append` itself
+//! never produces a snapshot event — the maintenance path is the only writer
+//! — and the append-only DDL triggers stay in force during normal operation:
+//! the maintenance operation drops them inside its own transaction and
+//! re-creates them before committing, so no other connection ever observes a
+//! state where a raw `DELETE` against `events` would be permitted.
+//!
+//! After compaction, `Store::state_at(stream, seq)`:
+//!
+//! - for `seq < boundary` returns [`StoreError::SeqCompacted`] — the events
+//!   that would be needed to reconstruct the pre-boundary state have been
+//!   discarded, so the state is not materially reachable any more,
+//! - for `seq == boundary` returns the snapshot state directly (the snapshot
+//!   event's patch is the only replay step needed),
+//! - for `seq > boundary` replays forward from the snapshot as normal.
+//!
+//! `Store::revert(stream, to)` and `Store::revert_with_meta` inherit the
+//! same error: they call `state_at(stream, to)` internally and surface
+//! `SeqCompacted` verbatim when `to` falls below the boundary. `Store::head`
+//! and `Store::seq_at_time` are not clamped: they can still return seqs at or
+//! below the boundary purely because those events physically existed at that
+//! coordinate in the log — a subsequent `state_at` on a `seq_at_time` result
+//! that falls below the boundary is the one that surfaces the error.
+//!
+//! Archived exports of the compacted-away events and policy-driven retention
+//! that drives when compaction runs are out of scope here and tracked as
+//! Phase 2 / Phase 3 follow-ups.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -141,6 +178,26 @@ use crate::state::{empty_state, replay_from};
 
 /// Kind used for the internal event a `revert` writes to the log.
 pub const REVERT_KIND: &str = "reverted";
+
+/// Canonical kind for the snapshot event a compaction maintenance operation
+/// leaves at the compaction boundary.
+///
+/// Compaction is not a facade concern — the facade never *appends* an event
+/// of this kind. It is produced by backend-specific maintenance APIs
+/// (`ai_store_sqlite::SqliteMaintenance::compact_stream` for the bundled
+/// SQLite backend) that atomically replace a stream's event prefix with one
+/// event of this kind carrying the materialized state at the compaction
+/// boundary in its patch. Consumers that gate on kind should either accept
+/// `SNAPSHOT_KIND` (a normal replay path — the snapshot patch is a plain
+/// `add "/"` that populates the base state) or reject appends of it via
+/// [`crate::KindGate`], since a foreign `Store::append` with this kind would place a
+/// bogus "snapshot" mid-stream that later replays would fold on top of real
+/// state.
+///
+/// See the "Compaction and history boundary" section in the module-level
+/// rustdoc, and [`StoreError::SeqCompacted`] for the boundary error returned
+/// from [`Store::state_at`] / [`Store::revert`] on pre-boundary seqs.
+pub const SNAPSHOT_KIND: &str = "compacted";
 
 /// Canonical kind for the tombstone event [`Store::delete`] appends.
 ///
@@ -573,6 +630,15 @@ impl Store {
     }
 
     /// State of `stream` at coordinate `at`. Uses cache-nearest + replay.
+    ///
+    /// Returns [`StoreError::SeqCompacted`] when `at` falls strictly before
+    /// this stream's compaction boundary (see [`SNAPSHOT_KIND`] and the
+    /// "Compaction and history boundary" section in the module-level rustdoc):
+    /// the events that would be needed to reconstruct state at `at` have been
+    /// replaced by a snapshot, so the pre-boundary state is no longer
+    /// materially reachable. `state_at(stream, boundary)` itself still works
+    /// — the snapshot event materializes exactly that state — and any seq
+    /// after the boundary replays forward from it as usual.
     pub async fn state_at(&self, stream: &StreamId, at: Seq) -> Result<Value, StoreError> {
         let head = self.events.head(stream).await?;
         match head {
@@ -586,6 +652,15 @@ impl Store {
             Some(_) => {}
         }
 
+        if let Some(boundary) = self.events.compaction_boundary(stream).await? {
+            if at < boundary {
+                return Err(StoreError::SeqCompacted {
+                    boundary,
+                    requested: at,
+                });
+            }
+        }
+
         let (base_state, from) = match self.cache.nearest(stream, at).await? {
             Some((seq, state)) => (state, seq.next()),
             None => (empty_state(), Seq::ZERO.next()),
@@ -596,6 +671,13 @@ impl Store {
         }
         let limit = (at.0 - from.0 + 1) as usize;
         let events = self.events.read(stream, from, limit).await?;
+        // Compaction leaves gaps in the seq sequence — the reader may
+        // legitimately return fewer than `limit` events, or events with
+        // seqs beyond `at` when the earliest event on the stream is a
+        // snapshot at `from > 1`. Trim the replay set to `seq <= at` so
+        // the reconstructed state matches the caller's requested coordinate
+        // regardless of where the compaction boundary sits.
+        let events: Vec<_> = events.into_iter().take_while(|e| e.seq <= at).collect();
         replay_from(base_state, &events)
     }
 

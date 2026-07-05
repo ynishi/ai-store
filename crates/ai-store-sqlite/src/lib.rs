@@ -115,11 +115,16 @@
 
 mod backend;
 mod driver;
+pub mod maintenance;
 mod migration;
 pub mod read_model;
 mod store;
 
 pub use backend::{SqliteCacheBackend, SqliteCheckpointBackend, SqliteEventBackend};
 pub use driver::{SqliteBackendDriver, SqliteBackends};
+pub use maintenance::{
+    snapshot_meta_compacted_at_seq, CompactionReport, SqliteMaintenance,
+    SNAPSHOT_META_KEY_COMPACTED_AT_SEQ,
+};
 pub use read_model::{Filter, Order, Query, ReadModelRow, SqliteReadModel};
 pub use store::SqliteStore;

@@ -137,6 +137,30 @@ pub trait EventBackend: Send + Sync {
     /// Enumerate all known streams.
     async fn streams(&self) -> Result<Vec<StreamId>, StoreError>;
 
+    /// Earliest seq still materially reachable in `stream` after a compaction
+    /// maintenance operation has replaced its prefix with a snapshot event
+    /// (kind [`crate::SNAPSHOT_KIND`]).
+    ///
+    /// Returns `None` for streams that have never been compacted — every
+    /// event since `Seq(1)` is still on the log, and state at any prior seq
+    /// remains materially reachable via cache-nearest + replay. Backends that
+    /// support compaction return `Some(boundary)` where `boundary` is the seq
+    /// of the snapshot event: [`crate::Store::state_at`] rejects requests for
+    /// any seq strictly below it with [`crate::StoreError::SeqCompacted`].
+    ///
+    /// The default implementation returns `Ok(None)` so backends that do not
+    /// (and will not) support compaction — such as the in-memory backend —
+    /// continue to compile and behave exactly as before this method was
+    /// added. Backends that ship a maintenance API (e.g.
+    /// `ai_store_sqlite::SqliteMaintenance`) override it with a real lookup.
+    async fn compaction_boundary(
+        &self,
+        stream: &StreamId,
+    ) -> Result<Option<Seq>, StoreError> {
+        let _ = stream;
+        Ok(None)
+    }
+
     /// Set (or overwrite) a label to point at a specific seq on this stream.
     async fn label_set(&self, stream: &StreamId, label: &Label, at: Seq) -> Result<(), StoreError>;
 
