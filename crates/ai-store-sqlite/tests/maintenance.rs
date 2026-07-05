@@ -355,7 +355,10 @@ async fn compact_stream_prunes_cache_entries_below_the_boundary() {
         Arc::new(be.cache.clone()),
         Vec::new(),
         Vec::new(),
-        StoreConfig { cache_stride: 1 },
+        StoreConfig {
+            cache_stride: 1,
+            ..StoreConfig::default()
+        },
     );
     let maint = SqliteMaintenance::new(be.isle());
     let s = StreamId::new("doc");

@@ -64,7 +64,7 @@ use rusqlite::{params, OptionalExtension};
 use rusqlite_isle::AsyncIsle;
 use serde_json::Value;
 
-use crate::backend::to_store_err;
+use crate::backend::{from_isle_err, to_store_err};
 
 /// A single row materialized from the event log: the latest known state of
 /// one stream, as of `last_seq`.
@@ -383,7 +383,7 @@ impl SqliteReadModel {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         rows.into_iter().map(row_to_read_model_row).collect()
     }
@@ -406,7 +406,7 @@ impl SqliteReadModel {
                 })
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(count as u64)
     }
 
@@ -426,7 +426,7 @@ impl SqliteReadModel {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         row.map(row_to_read_model_row).transpose()
     }
 
@@ -445,7 +445,7 @@ impl SqliteReadModel {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         rows.into_iter().map(row_to_read_model_row).collect()
     }
 
@@ -466,7 +466,7 @@ impl SqliteReadModel {
         self.isle
             .call(move |conn| conn.execute_batch(&sql))
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
     }
 }
 
@@ -523,6 +523,6 @@ impl ProjectionSink for SqliteReadModel {
                 Ok(())
             })
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
     }
 }

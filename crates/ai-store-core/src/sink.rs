@@ -145,3 +145,83 @@ impl CatchUpReport {
         failures: Vec::new(),
     };
 }
+
+/// Which dispatch call the [`SinkFailureObserver`] is being notified about.
+///
+/// Kept as a small enum rather than a string so consumers can pattern-match
+/// on the specific operation without depending on wording of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SinkOp {
+    /// The post-`Store::append` (or `import_event`) inline `commit` call —
+    /// the sink returned `Err` from [`ProjectionSink::commit`] and the
+    /// facade left the sink's checkpoint unadvanced, so the next
+    /// `catch_up` will re-drive the same `(stream, seq)`.
+    Commit,
+    /// The post-`Store::label_set` `on_label_set` call — the sink returned
+    /// `Err` from [`ProjectionSink::on_label_set`]. Label state on the
+    /// backend has already been updated regardless.
+    LabelSet,
+    /// The post-`Store::label_delete` `on_label_deleted` call — the sink
+    /// returned `Err` from [`ProjectionSink::on_label_deleted`]. Label
+    /// state on the backend has already been updated regardless.
+    LabelDeleted,
+}
+
+/// One observed sink dispatch failure. Handed to
+/// [`SinkFailureObserver::on_failure`] each time a sink's inline dispatch
+/// (`commit` after an append, `on_label_set` after a label pin, or
+/// `on_label_deleted` after a label delete) returns `Err`.
+///
+/// The facade's own recovery behavior is unchanged: `commit` failures leave
+/// the checkpoint unadvanced so the next `catch_up` re-drives them, and
+/// label callbacks are best-effort by design. The observer is a *visibility*
+/// hook — it lets a consumer log, count, or alert on falls-behind sinks
+/// without changing dispatch semantics.
+#[derive(Debug, Clone)]
+pub struct SinkDispatchFailure {
+    /// [`ProjectionSink::id`] of the sink that failed.
+    pub sink_id: String,
+    /// Stream the dispatch was targeted at.
+    pub stream: StreamId,
+    /// Seq of the event that could not be dispatched. `None` for label
+    /// callbacks ([`SinkOp::LabelSet`] / [`SinkOp::LabelDeleted`]) since the
+    /// dispatch is not indexed by seq.
+    pub seq: Option<Seq>,
+    /// Which dispatch operation failed.
+    pub op: SinkOp,
+    /// Human-readable failure text ([`StoreError`]'s `Display`).
+    pub error: String,
+}
+
+/// Observer notified about inline sink dispatch failures.
+///
+/// Registered via `StoreBuilder::sink_failure_observer`. Implementations
+/// should be short and non-blocking — the observer is invoked from inside
+/// the write path (after the event has already been committed, but before
+/// [`Store::append`] returns to the caller), and a slow observer will delay
+/// every write.
+///
+/// A common shape is to forward to `tracing`:
+///
+/// ```
+/// use ai_store_core::{SinkDispatchFailure, SinkFailureObserver};
+///
+/// struct LogObserver;
+///
+/// impl SinkFailureObserver for LogObserver {
+///     fn on_failure(&self, failure: &SinkDispatchFailure) {
+///         eprintln!(
+///             "sink {} dispatch {:?} failed on stream {:?} seq {:?}: {}",
+///             failure.sink_id, failure.op,
+///             failure.stream, failure.seq, failure.error,
+///         );
+///     }
+/// }
+/// ```
+///
+/// [`Store::append`]: crate::Store::append
+pub trait SinkFailureObserver: Send + Sync {
+    /// Notified each time a sink dispatch call returned `Err`.
+    fn on_failure(&self, failure: &SinkDispatchFailure);
+}

@@ -209,6 +209,69 @@
 //! not support this pattern. The bundled `ai-store-sqlite` backend
 //! overrides it; `ai-store-mem` intentionally does not, since a single
 //! in-memory `Store` has no cross-process concurrency to guard against.
+//!
+//! ## Failure handling and best-effort paths
+//!
+//! `Store` classifies failures into typed variants so callers can decide
+//! how to react without pattern-matching on error message text. The
+//! actionable distinctions live on [`crate::StoreError`]:
+//!
+//! - [`crate::StoreError::Busy`] — resource contention that a bounded retry
+//!   can resolve. [`crate::StoreError::is_retryable`] returns `true` for
+//!   this variant only; every other failure is a durable rejection
+//!   (schema, patch, head conflict, corruption, storage, unsupported).
+//! - [`crate::StoreError::Storage`] — durable I/O failure (disk full,
+//!   permission denied, read-only medium). Retrying will not help until
+//!   the underlying condition changes.
+//! - [`crate::StoreError::Corruption`] — persisted data no longer decodes
+//!   to the expected shape. Indicates out-of-band tampering, an aborted
+//!   maintenance job, or a version skew; not retryable.
+//! - [`crate::StoreError::Backend`] — last-resort fallback when the
+//!   backend could not classify the failure into any of the above.
+//!
+//! Two paths inside the write critical section are *best-effort by design*
+//! rather than surfaced as errors:
+//!
+//! 1. **Sink dispatch**: after `append` durably commits the event, each
+//!    registered [`crate::ProjectionSink`] receives the new state inline.
+//!    A sink whose `commit` returns `Err` leaves its checkpoint parked so
+//!    the next `catch_up` re-drives it — but the error itself is *not*
+//!    propagated to the `append` caller (the event is durable regardless).
+//!    Attach a [`crate::SinkFailureObserver`] via
+//!    [`crate::StoreBuilder::sink_failure_observer`] to observe these
+//!    silent falls-behind: the observer is invoked from within the write
+//!    path (after the log write, before `append` returns), and receives a
+//!    [`crate::SinkDispatchFailure`] naming the sink, stream, seq, and
+//!    operation. The same observer covers `on_label_set` /
+//!    `on_label_deleted` dispatches after `label_set` / `label_delete`.
+//! 2. **Automatic cache pruning**: when
+//!    [`StoreConfig::cache_keep_latest`] is set, a failed prune after a
+//!    cache-stride write is silently ignored — the next cache-stride
+//!    write retries, and [`Store::prune_cache`] remains available as an
+//!    explicit maintenance entry point. Failures here never fail the
+//!    `append`.
+//!
+//! ### Cache growth model
+//!
+//! [`crate::CacheBackend`] is derived state, not source of truth. Every
+//! cache-stride write inserts one row per stream, so a stream with head
+//! `H` and stride `S` carries `ceil(H / S)` cache rows unless something
+//! prunes them. The default configuration
+//! ([`StoreConfig::cache_keep_latest`] `= None`) preserves the pre-existing
+//! behavior: cache rows accumulate and the caller is responsible for
+//! pruning. Two ways to bound the footprint:
+//!
+//! - Set `cache_keep_latest = Some(k)` on [`StoreConfig`] (or use
+//!   [`crate::StoreBuilder::cache_keep_latest`]) to automatically keep
+//!   only the `k` most-recent cache rows per stream after every
+//!   cache-stride write. This is the low-effort path — call sites keep
+//!   using `append` unchanged.
+//! - Call [`Store::prune_cache`] explicitly during maintenance windows.
+//!   This is the low-latency path — a bulk prune in a quiet period
+//!   trades one operation for many trimmed rows.
+//!
+//! Neither option risks history: [`Store::state_at`] reconstructs any lost
+//! snapshot by replaying forward from a still-cached nearest neighbor.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -223,7 +286,9 @@ use crate::error::StoreError;
 use crate::event::{Committed, Event, NewEvent};
 use crate::gate::{GateCtx, SchemaGate};
 use crate::id::{Label, Seq, StreamId, Timestamp};
-use crate::sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
+use crate::sink::{
+    CatchUpFailure, CatchUpReport, ProjectionSink, SinkDispatchFailure, SinkFailureObserver, SinkOp,
+};
 use crate::state::{empty_state, replay_from};
 
 /// Kind used for the internal event a `revert` writes to the log.
@@ -281,11 +346,27 @@ enum WriteMode {
 pub struct StoreConfig {
     /// Materialize state into the cache every N events (0 = never cache).
     pub cache_stride: u64,
+    /// If set, after every cache-stride write the facade opportunistically
+    /// asks the [`crate::CacheBackend`] to keep only the `keep_latest` most
+    /// recent snapshots for that stream, deleting older ones. Trades
+    /// slightly-longer replays on `state_at` for a bounded cache footprint.
+    ///
+    /// `None` (the default) preserves the pre-existing behavior: cache
+    /// entries accumulate at one per `cache_stride` events per stream, and
+    /// pruning is the caller's responsibility (either via
+    /// [`Store::prune_cache`] or a backend-specific maintenance API).
+    /// `Some(k)` opts into automatic bounded caching: a cache-stride write
+    /// that lands in an already-K-deep cache silently trims the oldest
+    /// entries.
+    pub cache_keep_latest: Option<usize>,
 }
 
 impl Default for StoreConfig {
     fn default() -> Self {
-        Self { cache_stride: 64 }
+        Self {
+            cache_stride: 64,
+            cache_keep_latest: None,
+        }
     }
 }
 
@@ -311,6 +392,13 @@ pub struct Store {
     /// stream ever seen. This mirrors the existing `checkpoints` map (same
     /// trade-off, same justification: the alternative is a correctness bug).
     stream_locks: Arc<StdMutex<HashMap<StreamId, Arc<Mutex<()>>>>>,
+    /// Optional visibility hook — see [`crate::SinkFailureObserver`].
+    /// Invoked from inline dispatch (`commit` after `append`,
+    /// `on_label_set` after `label_set`, `on_label_deleted` after
+    /// `label_delete`) whenever a sink returns `Err`. Dispatch semantics
+    /// themselves (checkpoint parked / label backend already advanced) are
+    /// unchanged.
+    sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
     config: StoreConfig,
 }
 
@@ -388,6 +476,23 @@ impl Store {
         config: StoreConfig,
         checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
     ) -> Self {
+        Self::new_inner_with_observer(events, cache, gates, sinks, config, checkpoint_backend, None)
+    }
+
+    /// Inner constructor that also accepts an optional sink failure
+    /// observer. Kept crate-private because the exposed way to attach an
+    /// observer is [`StoreBuilder::sink_failure_observer`] — the builder
+    /// stays the one construction entry point that knows every optional
+    /// hook.
+    pub(crate) fn new_inner_with_observer(
+        events: Arc<dyn EventBackend>,
+        cache: Arc<dyn CacheBackend>,
+        gates: Vec<Arc<dyn SchemaGate>>,
+        sinks: Vec<Arc<dyn ProjectionSink>>,
+        config: StoreConfig,
+        checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
+        sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
+    ) -> Self {
         Self {
             events,
             cache,
@@ -396,7 +501,29 @@ impl Store {
             checkpoints: Arc::new(Mutex::new(HashMap::new())),
             checkpoint_backend,
             stream_locks: Arc::new(StdMutex::new(HashMap::new())),
+            sink_failure_observer,
             config,
+        }
+    }
+
+    /// Notify the observer if one is attached; no-op otherwise. Kept small
+    /// enough to inline at each dispatch site without noise.
+    fn notify_sink_failure(
+        &self,
+        sink_id: &str,
+        stream: &StreamId,
+        seq: Option<Seq>,
+        op: SinkOp,
+        error: &StoreError,
+    ) {
+        if let Some(observer) = &self.sink_failure_observer {
+            observer.on_failure(&SinkDispatchFailure {
+                sink_id: sink_id.to_string(),
+                stream: stream.clone(),
+                seq,
+                op,
+                error: error.to_string(),
+            });
         }
     }
 
@@ -741,6 +868,15 @@ impl Store {
         if let Some(ref next_state) = next {
             if cache_hit {
                 self.cache.put(stream, seq, next_state).await?;
+                // Opportunistic bounded pruning when the caller opted in via
+                // `StoreConfig::cache_keep_latest`. The cache is derived
+                // state (see `CacheBackend`); a failed prune here is
+                // silently swallowed — the next cache-stride write retries
+                // and `Store::prune_cache` remains available as a manual
+                // entry point. This never fails the append itself.
+                if let Some(keep) = self.config.cache_keep_latest {
+                    let _ = self.cache.prune(stream, keep).await;
+                }
             }
 
             // Post-commit sink dispatch (best-effort; failure leaves checkpoint alone).
@@ -756,14 +892,30 @@ impl Store {
                         if seq <= checkpoint {
                             continue;
                         }
-                        if sink.commit(stream, seq, next_state, &ev).await.is_ok() {
-                            // Only advance the checkpoint contiguously. If there is
-                            // a gap (an earlier seq failed dispatch), leave the
-                            // checkpoint parked so catch_up will re-drive the gap.
-                            // A failed persist (see `checkpoint_advance`) is
-                            // likewise left parked for catch_up to redrive.
-                            if seq == checkpoint.next() {
-                                self.checkpoint_advance(sink.id(), stream, seq).await;
+                        match sink.commit(stream, seq, next_state, &ev).await {
+                            Ok(()) => {
+                                // Only advance the checkpoint contiguously. If there is
+                                // a gap (an earlier seq failed dispatch), leave the
+                                // checkpoint parked so catch_up will re-drive the gap.
+                                // A failed persist (see `checkpoint_advance`) is
+                                // likewise left parked for catch_up to redrive.
+                                if seq == checkpoint.next() {
+                                    self.checkpoint_advance(sink.id(), stream, seq).await;
+                                }
+                            }
+                            Err(e) => {
+                                // Best-effort dispatch: checkpoint stays put so
+                                // catch_up re-drives this seq. Surface the failure
+                                // through the observer (if attached) so the caller
+                                // can see the sink falling behind without waiting
+                                // for a manual catch_up call.
+                                self.notify_sink_failure(
+                                    sink.id(),
+                                    stream,
+                                    Some(seq),
+                                    SinkOp::Commit,
+                                    &e,
+                                );
                             }
                         }
                     }
@@ -964,6 +1116,29 @@ impl Store {
         self.events.head(stream).await
     }
 
+    /// Prune the cache for `stream`, keeping only the `keep_latest` most
+    /// recent snapshot rows.
+    ///
+    /// The cache is derived state — `Store::state_at` reconstructs any lost
+    /// snapshot from the log by replaying forward from a still-cached
+    /// nearest neighbor — so this operation is always safe: it trades a
+    /// slightly-longer replay on `state_at` for a bounded cache footprint.
+    /// The append-only history on [`crate::EventBackend`] is untouched.
+    ///
+    /// Callers who want pruning to happen automatically after every
+    /// cache-stride write should set [`StoreConfig::cache_keep_latest`] at
+    /// construction; those errors are silently ignored (the next write
+    /// retries). This method is the explicit alternative: run it during
+    /// maintenance windows, or when a long-running stream's cache has
+    /// grown past what a consumer wants to keep on disk.
+    pub async fn prune_cache(
+        &self,
+        stream: &StreamId,
+        keep_latest: usize,
+    ) -> Result<(), StoreError> {
+        self.cache.prune(stream, keep_latest).await
+    }
+
     /// Greatest `Seq` whose event timestamp is `<= at`.
     ///
     /// Useful for wall-clock-anchored operations (e.g. "restore to how the
@@ -1049,7 +1224,9 @@ impl Store {
                     if !sink.accepts(stream) {
                         continue;
                     }
-                    let _ = sink.on_label_set(stream, label, at, &state, &event).await;
+                    if let Err(e) = sink.on_label_set(stream, label, at, &state, &event).await {
+                        self.notify_sink_failure(sink.id(), stream, Some(at), SinkOp::LabelSet, &e);
+                    }
                 }
             }
         }
@@ -1092,7 +1269,9 @@ impl Store {
                 if !sink.accepts(stream) {
                     continue;
                 }
-                let _ = sink.on_label_deleted(stream, label).await;
+                if let Err(e) = sink.on_label_deleted(stream, label).await {
+                    self.notify_sink_failure(sink.id(), stream, None, SinkOp::LabelDeleted, &e);
+                }
             }
         }
         Ok(existed)

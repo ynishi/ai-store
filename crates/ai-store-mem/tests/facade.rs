@@ -795,7 +795,10 @@ async fn append_fast_path_preserves_state_semantics() {
         Arc::new(MemCacheBackend::new()),
         Vec::new(),
         Vec::new(),
-        StoreConfig { cache_stride: 100 },
+        StoreConfig {
+            cache_stride: 100,
+            ..StoreConfig::default()
+        },
     );
     let s = StreamId::new("doc");
 

@@ -9,7 +9,13 @@ use thiserror::Error;
 use crate::id::{Seq, StreamId};
 
 /// Error variants returned from the `Store` public facade.
+///
+/// `#[non_exhaustive]` is set so that additional failure modes can be
+/// classified into new variants in a later release without breaking
+/// downstream code that matches on this enum. Callers are expected to have
+/// a `_ =>` arm covering the "unknown / future" case.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// The candidate write was rejected by a `SchemaGate`.
     #[error("schema violation: {0}")]
@@ -19,7 +25,47 @@ pub enum StoreError {
     #[error("patch application failed: {0}")]
     Patch(String),
 
-    /// Backend I/O or persistence failure (SQLite error, disk error, etc.).
+    /// Resource contention with another writer or transaction — the
+    /// operation did not proceed, but retrying it after a delay is a
+    /// reasonable strategy (see [`StoreError::is_retryable`]).
+    ///
+    /// Backend-specific mapping: `ai-store-sqlite` returns this when a
+    /// SQLite operation raises `SQLITE_BUSY` or `SQLITE_LOCKED` that
+    /// survives the driver-configured `busy_timeout`. Callers who want to
+    /// implement bounded retries can loop on
+    /// `matches!(err, StoreError::Busy)` instead of pattern-matching on
+    /// backend-specific strings.
+    #[error("busy: {0}")]
+    Busy(String),
+
+    /// Underlying storage (disk, filesystem, database file) reported an
+    /// error that is not merely transient contention: disk full, permission
+    /// denied, read-only medium, corrupted I/O.
+    ///
+    /// Distinct from [`StoreError::Corruption`], which is reserved for
+    /// *data* that decoded incorrectly regardless of the underlying I/O
+    /// working fine.
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    /// Persisted data failed to decode into the expected shape — a JSON
+    /// row that is no longer valid JSON, a `Patch` field that does not
+    /// deserialize, a row whose columns do not match the current schema.
+    ///
+    /// Distinct from [`StoreError::Storage`]: the disk read succeeded, the
+    /// bytes just do not mean what they should. Typically indicates
+    /// out-of-band tampering, an aborted maintenance job, or a version
+    /// skew between the writer and reader.
+    #[error("corruption: {0}")]
+    Corruption(String),
+
+    /// Backend I/O or persistence failure that could not be classified
+    /// into a more specific variant.
+    ///
+    /// This is the last-resort fallback — new failure modes should be
+    /// classified as [`StoreError::Busy`] / [`StoreError::Storage`] /
+    /// [`StoreError::Corruption`] whenever the backend can tell them apart
+    /// from a generic error.
     #[error("backend error: {0}")]
     Backend(String),
 
@@ -88,6 +134,24 @@ pub enum StoreError {
     /// short operation name (e.g. `"import_event"`).
     #[error("backend does not support this operation: {0}")]
     BackendUnsupported(String),
+}
+
+impl StoreError {
+    /// Whether the caller can reasonably retry the failed operation.
+    ///
+    /// Currently returns `true` for [`StoreError::Busy`] only — the only
+    /// variant that represents transient contention rather than a durable
+    /// failure of the request. Schema violations, patch application
+    /// failures, storage errors, corruption, backend unsupported, and
+    /// head-conflict errors are *not* retryable: repeating the same call
+    /// against the same state will produce the same failure.
+    ///
+    /// This exists so callers can write a bounded retry loop without
+    /// depending on error message text or on backend-specific error types
+    /// leaking through the facade.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, StoreError::Busy(_))
+    }
 }
 
 /// Rejection payload emitted by a `SchemaGate` implementation.

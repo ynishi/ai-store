@@ -140,7 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new(),
         Vec::new(),
         // Larger stride than default suits bulk backfills. Tune per workload.
-        StoreConfig { cache_stride: 256 },
+        StoreConfig {
+            cache_stride: 256,
+            ..StoreConfig::default()
+        },
     );
     let stream = StreamId::new("doc/legacy-001");
 

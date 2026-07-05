@@ -27,7 +27,7 @@ use rusqlite::params;
 use rusqlite_isle::AsyncIsle;
 use serde_json::{json, Value};
 
-use crate::backend::to_store_err;
+use crate::backend::{from_isle_err, to_store_err};
 
 /// Outcome of a successful [`SqliteMaintenance::compact_stream`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +231,7 @@ impl SqliteMaintenance {
                 Ok(())
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         Ok(CompactionReport {
             stream: stream.clone(),

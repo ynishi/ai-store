@@ -44,7 +44,9 @@ pub use facade::{Store, StoreConfig, REVERT_KIND, SNAPSHOT_KIND, TOMBSTONE_KIND}
 pub use gate::{GateCtx, SchemaGate};
 pub use id::{Label, Seq, StreamId, Timestamp};
 pub use kind_gate::KindGate;
-pub use sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
+pub use sink::{
+    CatchUpFailure, CatchUpReport, ProjectionSink, SinkDispatchFailure, SinkFailureObserver, SinkOp,
+};
 pub use state::{empty_state, replay_from};
 
 // Re-export the patch type so consumers don't need a direct json-patch dep to

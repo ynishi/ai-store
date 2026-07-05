@@ -96,6 +96,57 @@ pub(crate) fn to_store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Classify a [`rusqlite::Error`] into the most specific [`StoreError`]
+/// variant we can identify from the SQLite error code.
+///
+/// Preserves the underlying error text as the variant payload so
+/// caller-side logs and error dumps still surface the exact rusqlite
+/// message; the variant itself is what a caller pattern-matches on for
+/// retry / triage decisions (see [`StoreError::is_retryable`]).
+pub(crate) fn classify_rusqlite(e: rusqlite::Error) -> StoreError {
+    use rusqlite::ErrorCode;
+    match &e {
+        rusqlite::Error::SqliteFailure(f, _) => match f.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                StoreError::Busy(e.to_string())
+            }
+            ErrorCode::DiskFull
+            | ErrorCode::PermissionDenied
+            | ErrorCode::ReadOnly
+            | ErrorCode::CannotOpen
+            | ErrorCode::SystemIoFailure => StoreError::Storage(e.to_string()),
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                StoreError::Corruption(e.to_string())
+            }
+            _ => StoreError::Backend(e.to_string()),
+        },
+        rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..) => {
+            StoreError::Corruption(e.to_string())
+        }
+        _ => StoreError::Backend(e.to_string()),
+    }
+}
+
+/// Classify a [`rusqlite_isle::IsleError`] into a [`StoreError`] — the
+/// SQLite-layer error is unwrapped and routed through
+/// [`classify_rusqlite`]; every non-SQL isle failure (cancelled / timeout /
+/// closed / queue full / panicked) is a plain backend error.
+pub(crate) fn from_isle_err(e: rusqlite_isle::IsleError) -> StoreError {
+    match e {
+        rusqlite_isle::IsleError::Sqlite(err) => classify_rusqlite(err),
+        other => StoreError::Backend(other.to_string()),
+    }
+}
+
+/// Map a JSON decode error from a persisted row to
+/// [`StoreError::Corruption`] — the storage read succeeded, but the bytes
+/// did not deserialize to the expected shape.
+pub(crate) fn decode_corruption<E: std::fmt::Display>(field: &str, e: E) -> StoreError {
+    StoreError::Corruption(format!("{field} decode: {e}"))
+}
+
 fn row_to_event(
     seq: u64,
     kind: String,
@@ -104,9 +155,9 @@ fn row_to_event(
     at_ms: i64,
 ) -> Result<Event, StoreError> {
     let patch: Patch = serde_json::from_str(&patch_json)
-        .map_err(|e| StoreError::Backend(format!("patch decode: {e}")))?;
+        .map_err(|e| decode_corruption("events.patch", e))?;
     let meta: Value = serde_json::from_str(&meta_json)
-        .map_err(|e| StoreError::Backend(format!("meta decode: {e}")))?;
+        .map_err(|e| decode_corruption("events.meta", e))?;
     Ok(Event {
         seq: Seq(seq),
         kind,
@@ -154,7 +205,7 @@ impl SqliteEventBackend {
                 Ok(next_seq as u64)
             })
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
             .map(Seq)?;
         Ok(Committed {
             seq,
@@ -233,7 +284,7 @@ impl EventBackend for SqliteEventBackend {
                 Ok(CasOutcome::Committed(next_seq as u64))
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         match outcome {
             CasOutcome::Committed(seq) => Ok(Committed {
@@ -278,7 +329,7 @@ impl EventBackend for SqliteEventBackend {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         rows.into_iter()
             .map(|(s, k, p, m, t)| row_to_event(s as u64, k, p, m, t))
@@ -354,7 +405,7 @@ impl EventBackend for SqliteEventBackend {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         rows.into_iter()
             .map(|(s, k, p, m, t)| row_to_event(s as u64, k, p, m, t))
@@ -375,7 +426,7 @@ impl EventBackend for SqliteEventBackend {
                 .map(|opt| opt.flatten())
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(head.map(|h| Seq(h as u64)))
     }
 
@@ -406,7 +457,7 @@ impl EventBackend for SqliteEventBackend {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(seq.map(|s| Seq(s as u64)))
     }
 
@@ -420,7 +471,7 @@ impl EventBackend for SqliteEventBackend {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(rows.into_iter().map(StreamId).collect())
     }
 
@@ -451,7 +502,7 @@ impl EventBackend for SqliteEventBackend {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(earliest.and_then(|(seq, kind)| {
             if kind == SNAPSHOT_KIND {
                 Some(Seq(seq as u64))
@@ -499,7 +550,7 @@ impl EventBackend for SqliteEventBackend {
                 Ok((true, None))
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
 
         if outcome.0 {
             Ok(())
@@ -529,7 +580,7 @@ impl EventBackend for SqliteEventBackend {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(seq.map(|s| Seq(s as u64)))
     }
 
@@ -549,7 +600,7 @@ impl EventBackend for SqliteEventBackend {
                 rows
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(rows
             .into_iter()
             .map(|(n, s)| (Label(n), Seq(s as u64)))
@@ -568,7 +619,7 @@ impl EventBackend for SqliteEventBackend {
                 )
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(changed > 0)
     }
 }
@@ -589,7 +640,7 @@ impl CacheBackend for SqliteCacheBackend {
                 Ok(())
             })
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
     }
 
     async fn nearest(
@@ -612,11 +663,12 @@ impl CacheBackend for SqliteCacheBackend {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         match row {
             None => Ok(None),
             Some((s, json)) => {
-                let value: Value = serde_json::from_str(&json).map_err(to_store_err)?;
+                let value: Value = serde_json::from_str(&json)
+                    .map_err(|e| decode_corruption("cache.state", e))?;
                 Ok(Some((Seq(s as u64), value)))
             }
         }
@@ -637,7 +689,7 @@ impl CacheBackend for SqliteCacheBackend {
                 Ok(())
             })
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
     }
 }
 
@@ -657,7 +709,7 @@ impl CheckpointBackend for SqliteCheckpointBackend {
                 .optional()
             })
             .await
-            .map_err(to_store_err)?;
+            .map_err(from_isle_err)?;
         Ok(seq.map(|s| Seq(s as u64)))
     }
 
@@ -675,6 +727,100 @@ impl CheckpointBackend for SqliteCheckpointBackend {
                 Ok(())
             })
             .await
-            .map_err(to_store_err)
+            .map_err(from_isle_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi;
+    use rusqlite::{Error as RError, ErrorCode as EC};
+
+    fn sqlite_failure(code: EC, extended: i32) -> RError {
+        RError::SqliteFailure(
+            ffi::Error {
+                code,
+                extended_code: extended,
+            },
+            Some("test error".to_string()),
+        )
+    }
+
+    #[test]
+    fn classify_maps_busy_and_locked_to_busy_variant() {
+        for code in [EC::DatabaseBusy, EC::DatabaseLocked] {
+            let e = sqlite_failure(code, 0);
+            let mapped = classify_rusqlite(e);
+            assert!(
+                matches!(mapped, StoreError::Busy(_)),
+                "code {code:?} should map to Busy, got {mapped:?}"
+            );
+            assert!(mapped.is_retryable(), "Busy variant must be retryable");
+        }
+    }
+
+    #[test]
+    fn classify_maps_io_related_codes_to_storage_variant() {
+        for code in [
+            EC::DiskFull,
+            EC::PermissionDenied,
+            EC::ReadOnly,
+            EC::CannotOpen,
+            EC::SystemIoFailure,
+        ] {
+            let e = sqlite_failure(code, 0);
+            let mapped = classify_rusqlite(e);
+            assert!(
+                matches!(mapped, StoreError::Storage(_)),
+                "code {code:?} should map to Storage, got {mapped:?}"
+            );
+            assert!(!mapped.is_retryable());
+        }
+    }
+
+    #[test]
+    fn classify_maps_corruption_codes_to_corruption_variant() {
+        for code in [EC::DatabaseCorrupt, EC::NotADatabase] {
+            let e = sqlite_failure(code, 0);
+            let mapped = classify_rusqlite(e);
+            assert!(
+                matches!(mapped, StoreError::Corruption(_)),
+                "code {code:?} should map to Corruption, got {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_falls_back_to_backend_for_other_codes() {
+        let e = sqlite_failure(EC::ConstraintViolation, 0);
+        let mapped = classify_rusqlite(e);
+        assert!(
+            matches!(mapped, StoreError::Backend(_)),
+            "unclassified code should stay in Backend, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn from_isle_err_unwraps_sqlite_and_classifies() {
+        let inner = sqlite_failure(EC::DatabaseBusy, 0);
+        let iso_e = rusqlite_isle::IsleError::Sqlite(inner);
+        assert!(matches!(from_isle_err(iso_e), StoreError::Busy(_)));
+    }
+
+    #[test]
+    fn from_isle_err_treats_non_sqlite_variants_as_backend() {
+        // Cancelled / Timeout / Closed / QueueFull / Panicked are all
+        // isle-layer conditions, not SQL-layer failures — they belong in the
+        // Backend fallback variant.
+        for iso_e in [
+            rusqlite_isle::IsleError::Cancelled,
+            rusqlite_isle::IsleError::Timeout,
+            rusqlite_isle::IsleError::Closed,
+            rusqlite_isle::IsleError::QueueFull,
+            rusqlite_isle::IsleError::Panicked("boom".into()),
+        ] {
+            assert!(matches!(from_isle_err(iso_e), StoreError::Backend(_)));
+        }
     }
 }

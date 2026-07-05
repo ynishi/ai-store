@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
 use crate::facade::{Store, StoreConfig};
 use crate::gate::SchemaGate;
-use crate::sink::ProjectionSink;
+use crate::sink::{ProjectionSink, SinkFailureObserver};
 
 /// Builder for [`Store`]. Obtain one via [`Store::builder`].
 pub struct StoreBuilder {
@@ -24,6 +24,7 @@ pub struct StoreBuilder {
     gates: Vec<Arc<dyn SchemaGate>>,
     sinks: Vec<Arc<dyn ProjectionSink>>,
     checkpoints: Option<Arc<dyn CheckpointBackend>>,
+    sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
     config: StoreConfig,
 }
 
@@ -39,6 +40,7 @@ impl StoreBuilder {
             gates: Vec::new(),
             sinks: Vec::new(),
             checkpoints: None,
+            sink_failure_observer: None,
             config: StoreConfig::default(),
         }
     }
@@ -76,27 +78,46 @@ impl StoreBuilder {
         self
     }
 
-    /// Shortcut for `config.cache_stride` without constructing a whole
-    /// `StoreConfig` — the common case, since `StoreConfig` currently has
-    /// exactly one field.
+    /// Shortcut for `config.cache_stride` — leaves every other
+    /// [`StoreConfig`] field at its current value.
     pub fn cache_stride(mut self, stride: u64) -> Self {
         self.config.cache_stride = stride;
         self
     }
 
-    /// Build the `Store`. Dispatches to `Store::with_checkpoint_backend` if
-    /// `.checkpoints(..)` was called, otherwise `Store::new`.
+    /// Shortcut for `config.cache_keep_latest` — opt in to automatic
+    /// bounded cache pruning after every cache-stride write. See
+    /// [`StoreConfig::cache_keep_latest`] for the trade-off.
+    pub fn cache_keep_latest(mut self, keep: usize) -> Self {
+        self.config.cache_keep_latest = Some(keep);
+        self
+    }
+
+    /// Attach a [`SinkFailureObserver`] to observe inline sink dispatch
+    /// failures (`commit` after `append`, `on_label_set` after
+    /// `label_set`, `on_label_deleted` after `label_delete`). Dispatch
+    /// semantics themselves are unchanged; the observer is a visibility
+    /// hook. See [`SinkFailureObserver`] for the shape of the callback.
+    pub fn sink_failure_observer(
+        mut self,
+        observer: Arc<dyn SinkFailureObserver>,
+    ) -> Self {
+        self.sink_failure_observer = Some(observer);
+        self
+    }
+
+    /// Build the `Store`. Dispatches to the private observer-aware
+    /// constructor with the optional [`SinkFailureObserver`] and
+    /// [`CheckpointBackend`] plumbing preserved.
     pub fn build(self) -> Store {
-        match self.checkpoints {
-            Some(checkpoints) => Store::with_checkpoint_backend(
-                self.events,
-                self.cache,
-                self.gates,
-                self.sinks,
-                self.config,
-                checkpoints,
-            ),
-            None => Store::new(self.events, self.cache, self.gates, self.sinks, self.config),
-        }
+        Store::new_inner_with_observer(
+            self.events,
+            self.cache,
+            self.gates,
+            self.sinks,
+            self.config,
+            self.checkpoints,
+            self.sink_failure_observer,
+        )
     }
 }
