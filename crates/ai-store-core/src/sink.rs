@@ -98,6 +98,36 @@ pub trait ProjectionSink: Send + Sync {
     async fn on_label_deleted(&self, _stream: &StreamId, _label: &Label) -> Result<(), StoreError> {
         Ok(())
     }
+
+    /// Whether [`crate::Store::catch_up`] against this sink must be
+    /// escalated to [`crate::Store::rebuild`] the first time it runs in a
+    /// fresh process.
+    ///
+    /// Default `false`: most sinks (`SqliteReadModel`, per-stream
+    /// `FileProjection`, callers persisting their own state) are safe to
+    /// resume from the persisted checkpoint alone — the only work
+    /// `catch_up` skips for those sinks is the events already reflected in
+    /// their durable output.
+    ///
+    /// A sink that keeps its rendered output *coupled across streams* in a
+    /// way it cannot reconstruct from disk (e.g.
+    /// `ai_store_fileproj::CombinedFileSink`, which folds every stream
+    /// into one file and holds the per-stream map only in memory) should
+    /// override this to `true`. The store then internally routes the first
+    /// `catch_up(sink_id)` call in this process through `rebuild`, so
+    /// streams whose checkpoint is already at head are re-driven from
+    /// `Seq::ZERO` and every stream's contribution reappears in the
+    /// rendered output — the "silent truncation on restart-then-catch-up"
+    /// failure mode is closed at the facade layer, not by relying on the
+    /// caller to remember to call `rebuild` themselves.
+    ///
+    /// The escalation is one-shot per `Store` instance: once the first
+    /// `catch_up` has completed, subsequent `catch_up(sink_id)` calls
+    /// behave normally. An explicit `Store::rebuild(sink_id)` call also
+    /// satisfies the requirement.
+    fn requires_rebuild_on_attach(&self) -> bool {
+        false
+    }
 }
 
 /// Detail for a single `(stream, sink)` pairing that failed during a

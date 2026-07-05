@@ -202,3 +202,143 @@ async fn combined_write_is_atomic_and_content_reflects_every_stream() {
     assert!(body.contains(r#"{"n":4}"#));
     assert!(body.contains(r#"{"n":40}"#));
 }
+
+// ---- restart-cold auto-escalation ---------------------------------------
+
+/// A `CheckpointBackend` that remembers checkpoints across `Store`
+/// instances, simulating a restart where the checkpoint table survived
+/// (e.g. `SqliteCheckpointBackend`) but every in-memory sink is fresh.
+#[derive(Default, Clone)]
+struct SharedCheckpoints(
+    Arc<std::sync::Mutex<std::collections::HashMap<(String, StreamId), Seq>>>,
+);
+
+#[async_trait::async_trait]
+impl ai_store_core::CheckpointBackend for SharedCheckpoints {
+    async fn get(
+        &self,
+        sink_id: &str,
+        stream: &StreamId,
+    ) -> Result<Option<Seq>, ai_store_core::StoreError> {
+        let map = self.0.lock().unwrap();
+        Ok(map.get(&(sink_id.to_string(), stream.clone())).copied())
+    }
+    async fn put(
+        &self,
+        sink_id: &str,
+        stream: &StreamId,
+        at: Seq,
+    ) -> Result<(), ai_store_core::StoreError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert((sink_id.to_string(), stream.clone()), at);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restart_cold_catch_up_auto_escalates_to_rebuild_for_combined_sink() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("combined.md");
+    let events: Arc<dyn ai_store_core::EventBackend> = Arc::new(MemEventBackend::new());
+    let cache: Arc<dyn ai_store_core::CacheBackend> = Arc::new(MemCacheBackend::new());
+    let checkpoints: Arc<dyn ai_store_core::CheckpointBackend> =
+        Arc::new(SharedCheckpoints::default());
+
+    let alpha = StreamId::new("alpha");
+    let beta = StreamId::new("beta");
+
+    // ---- Pre-restart process: sink attached, writes land in the file ---
+    {
+        let sink = Arc::new(CombinedFileSink::new("combined", path.clone(), renderer()));
+        let store = Store::with_checkpoint_backend(
+            events.clone(),
+            cache.clone(),
+            Vec::new(),
+            vec![sink.clone()],
+            StoreConfig::default(),
+            checkpoints.clone(),
+        );
+        store
+            .append(
+                &alpha,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                &beta,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": { "n": 2 } }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("## alpha"));
+        assert!(body.contains("## beta"));
+    }
+
+    // ---- Post-restart process: same checkpoints, but a fresh sink -----
+    // Simulates a restart: the same MemEventBackend + MemCacheBackend
+    // survive (the log is durable at this layer), the SharedCheckpoints
+    // survive (persisted watermark), but the sink is a brand-new
+    // CombinedFileSink whose in-memory BTreeMap starts empty.
+    //
+    // If catch_up were to resume from the persisted checkpoints without
+    // escalation, it would find nothing new to dispatch (checkpoints are
+    // already at head) and never re-populate the map. The very next
+    // append on a single stream would then re-render the file with only
+    // that stream visible — the "silent truncation on restart" failure
+    // mode this issue closes.
+    {
+        let sink = Arc::new(CombinedFileSink::new("combined", path.clone(), renderer()));
+        let store = Store::with_checkpoint_backend(
+            events.clone(),
+            cache.clone(),
+            Vec::new(),
+            vec![sink.clone()],
+            StoreConfig::default(),
+            checkpoints.clone(),
+        );
+
+        // A plain `catch_up` here MUST auto-escalate to rebuild, because
+        // the sink declares `requires_rebuild_on_attach() -> true`.
+        let report = store.catch_up("combined").await.unwrap();
+        assert_eq!(report.applied, 2, "auto-rebuild must re-drive every event");
+        assert_eq!(report.failed, 0);
+
+        // The file still contains both streams — the pre-restart snapshot
+        // is intact, and the escalated rebuild's re-render matches it.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("## alpha"));
+        assert!(body.contains("## beta"));
+
+        // A follow-up `catch_up` in the same process is NOT re-escalated:
+        // it finds nothing new (both streams are at head) and applies 0.
+        let follow_up = store.catch_up("combined").await.unwrap();
+        assert_eq!(follow_up.applied, 0);
+
+        // And an ordinary append to just one stream still preserves the
+        // other stream's contribution — the map has been repopulated by
+        // the first catch_up, so this render includes both.
+        store
+            .append(
+                &alpha,
+                "bump",
+                patch(json!([{ "op": "replace", "path": "/n", "value": 10 }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("## alpha"));
+        assert!(body.contains("## beta"), "beta must remain in the file");
+        assert!(body.contains(r#"{"n":10}"#));
+    }
+}

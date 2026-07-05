@@ -63,10 +63,13 @@ struct Snapshot {
 /// - Restart-cold: the `BTreeMap` snapshot lives only in process memory (like
 ///   `FileProjection`'s draft, but unlike that per-stream layout there is no
 ///   way to reconstruct just the *changed* stream from disk — the file on
-///   disk has already folded every stream together and lost the
-///   per-stream boundary). After a restart the map starts empty; call
-///   `Store::rebuild` (not just `catch_up`) against this sink's checkpoint
-///   to repopulate every stream before trusting the rendered file again.
+///   disk has already folded every stream together and lost the per-stream
+///   boundary). This sink overrides
+///   [`ProjectionSink::requires_rebuild_on_attach`] to `true`, so the
+///   `Store` automatically escalates the first `catch_up(sink_id)` in a
+///   fresh process to a `rebuild`: every stream is re-driven from
+///   `Seq::ZERO` before the map is trusted. Callers do not need to
+///   remember to invoke `rebuild` themselves.
 ///
 /// ## Write skipping
 ///
@@ -116,6 +119,18 @@ impl CombinedFileSink {
 impl ProjectionSink for CombinedFileSink {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The in-memory `BTreeMap` snapshot is process-local: after a restart
+    /// there is no way to reconstruct the missing streams' entries just
+    /// from the file on disk, because the file has already been folded
+    /// through the renderer and lost the per-stream boundary. Signal this
+    /// to the store so a fresh-process `catch_up` gets escalated to a
+    /// `rebuild` (re-driving every stream from `Seq::ZERO`), closing the
+    /// "silent truncation on restart-then-catch-up" failure mode at the
+    /// facade layer.
+    fn requires_rebuild_on_attach(&self) -> bool {
+        true
     }
 
     async fn commit(

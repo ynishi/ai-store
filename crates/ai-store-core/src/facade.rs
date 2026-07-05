@@ -273,7 +273,7 @@
 //! Neither option risks history: [`Store::state_at`] reconstructs any lost
 //! snapshot by replaying forward from a still-cached nearest neighbor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use json_patch::diff;
@@ -399,6 +399,15 @@ pub struct Store {
     /// themselves (checkpoint parked / label backend already advanced) are
     /// unchanged.
     sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
+    /// Sink ids that have completed `catch_up` (or `rebuild`) in this
+    /// `Store` instance. Consulted by [`Store::catch_up`] to decide whether
+    /// a sink that
+    /// [`crate::ProjectionSink::requires_rebuild_on_attach`] must be
+    /// escalated to a `rebuild` — the first `catch_up` in a fresh process
+    /// forces a full replay for such sinks, subsequent calls resume
+    /// normally. Cleared on process restart by construction (in-memory
+    /// only, never persisted).
+    rebuilt_this_process: Arc<StdMutex<HashSet<String>>>,
     config: StoreConfig,
 }
 
@@ -502,6 +511,7 @@ impl Store {
             checkpoint_backend,
             stream_locks: Arc::new(StdMutex::new(HashMap::new())),
             sink_failure_observer,
+            rebuilt_this_process: Arc::new(StdMutex::new(HashSet::new())),
             config,
         }
     }
@@ -1347,15 +1357,63 @@ impl Store {
 
     /// Drive `sink_id` forward from its checkpoint to head on every known
     /// stream. On success the checkpoint advances; on failure it stays put.
+    ///
+    /// The first `catch_up` in this `Store` instance for a sink whose
+    /// [`ProjectionSink::requires_rebuild_on_attach`] returns `true` is
+    /// silently escalated to [`Store::rebuild`] — the sink's in-memory
+    /// state is empty in a fresh process, and resuming from the persisted
+    /// checkpoint alone would silently drop every stream whose head is
+    /// already past that checkpoint. See the trait method's rustdoc for
+    /// the shape of that failure mode. Subsequent `catch_up` calls to the
+    /// same sink id in the same instance behave normally.
     pub async fn catch_up(&self, sink_id: &str) -> Result<CatchUpReport, StoreError> {
-        self.catch_up_inner(sink_id, false).await
+        let needs_rebuild_escalation = self
+            .sinks
+            .iter()
+            .find(|s| s.id() == sink_id)
+            .map(|s| s.requires_rebuild_on_attach())
+            .unwrap_or(false)
+            && !self.has_been_rebuilt_this_process(sink_id);
+        let reset = needs_rebuild_escalation;
+        let report = self.catch_up_inner(sink_id, reset).await?;
+        // Record success — whether we ran a plain catch_up or an escalated
+        // rebuild — so we do not re-escalate on the next call.
+        self.mark_rebuilt_this_process(sink_id);
+        Ok(report)
     }
 
     /// Reset `sink_id`'s checkpoint to zero on every stream, then drive it
     /// forward. Equivalent to `catch_up` after checkpoint reset — no special
     /// rebuild API is needed at the backend level.
     pub async fn rebuild(&self, sink_id: &str) -> Result<CatchUpReport, StoreError> {
-        self.catch_up_inner(sink_id, true).await
+        let report = self.catch_up_inner(sink_id, true).await?;
+        // An explicit rebuild also satisfies the "must rebuild once per
+        // process" contract, so a subsequent `catch_up` for the same sink
+        // id will not re-escalate.
+        self.mark_rebuilt_this_process(sink_id);
+        Ok(report)
+    }
+
+    /// Whether `sink_id` has already completed a `catch_up` or `rebuild`
+    /// in this `Store` instance. Consulted only by
+    /// [`Store::catch_up`]'s auto-rebuild escalation path.
+    fn has_been_rebuilt_this_process(&self, sink_id: &str) -> bool {
+        let guard = self
+            .rebuilt_this_process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.contains(sink_id)
+    }
+
+    /// Mark `sink_id` as having completed at least one full `catch_up` or
+    /// `rebuild` cycle in this instance, so future `catch_up` calls skip
+    /// the auto-rebuild escalation.
+    fn mark_rebuilt_this_process(&self, sink_id: &str) {
+        let mut guard = self
+            .rebuilt_this_process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(sink_id.to_string());
     }
 
     /// Drive `sink_id` forward on every stream, isolating failures per
@@ -1397,6 +1455,16 @@ impl Store {
             let mut cursor = self.checkpoint_get(sink_id, &stream).await;
             let mut stream_failed = false;
 
+            // Bootstrap the running state *once* at `cursor` and fold each
+            // event's patch onto it forward, instead of re-materializing
+            // state via `state_at` for every event. `state_at` costs a
+            // cache-nearest lookup + a replay of events since that cache
+            // stride; running it once per event turned catch_up over N
+            // events into ~O(N * stride) patch applications. Threading one
+            // running state through the batch loop below drops that to
+            // exactly N patch applications total (plus one bootstrap).
+            let mut running_state: Option<Value> = None;
+
             while cursor < head && !stream_failed {
                 let from = cursor.next();
                 let events = self.events.read(&stream, from, 32).await?;
@@ -1404,12 +1472,57 @@ impl Store {
                     break;
                 }
                 for ev in events {
-                    let state = self.state_at(&stream, ev.seq).await?;
+                    // Lazy bootstrap: only pay for `state_at` when we're
+                    // about to hand the sink its first event of this call.
+                    // Streams with an already-at-head checkpoint never
+                    // reach here, so an empty catch_up is O(1) per stream.
+                    let state = match running_state.take() {
+                        Some(mut s) => {
+                            if let Err(e) = json_patch::patch(&mut s, &ev.patch) {
+                                // A patch that fails to apply here — after
+                                // the event was already durably committed
+                                // — is a corruption signal on the log, not
+                                // a plausible operational failure. Report
+                                // it against this stream and halt catch_up
+                                // for it: continuing would apply
+                                // subsequent patches on top of a stale /
+                                // partially-mutated state and dispatch
+                                // wrong `state` values to the sink.
+                                let msg = format!("patch apply seq={}: {}", ev.seq.0, e);
+                                report.failed += 1;
+                                report.failures.push(CatchUpFailure {
+                                    stream: stream.clone(),
+                                    sink_id: sink_id.to_string(),
+                                    message: msg,
+                                });
+                                report.skipped += (head.0 - ev.seq.0) as usize;
+                                stream_failed = true;
+                                break;
+                            }
+                            s
+                        }
+                        None => {
+                            // No running state yet: rebuild it as of the
+                            // event we're about to dispatch. Cache-nearest
+                            // + replay does this cheaply when the cache
+                            // stride has ever seen a snapshot near
+                            // `ev.seq`; on a rebuild with reset=true and
+                            // an empty cache it falls back to a full
+                            // replay from Seq(1), which is fine on the
+                            // *first* event of the stream but exactly the
+                            // cost the running-state carry avoids on
+                            // every subsequent event.
+                            self.state_at(&stream, ev.seq).await?
+                        }
+                    };
                     match sink.commit(&stream, ev.seq, &state, &ev).await {
                         Ok(()) => {
                             if self.checkpoint_advance(sink_id, &stream, ev.seq).await {
                                 report.applied += 1;
                                 cursor = ev.seq;
+                                // Carry state to the next iteration
+                                // instead of re-materializing.
+                                running_state = Some(state);
                             } else {
                                 report.failed += 1;
                                 report.failures.push(CatchUpFailure {

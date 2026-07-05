@@ -114,6 +114,18 @@ fn sanitize_component(raw: &str, kind: &str) -> Result<String, StoreError> {
     Ok(raw.to_string())
 }
 
+/// Read `path`'s contents as a `String` if the file exists, or return
+/// `Ok(None)` if it does not. Used by the label-set idempotence path to
+/// decide whether a re-render would change on-disk content before archiving
+/// and rewriting.
+async fn read_if_exists(path: &Path) -> Result<Option<String>, StoreError> {
+    match fs::read_to_string(path).await {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::Backend(format!("read {path:?}: {e}"))),
+    }
+}
+
 /// Write `body` to `path` via a temp-sibling-then-rename, so a partial write
 /// is never observed by a concurrent reader. Shared with
 /// [`crate::CombinedFileSink`], which writes one composed file instead of
@@ -175,11 +187,31 @@ impl ProjectionSink for FileProjection {
             .map_err(|e| StoreError::Backend(format!("mkdir {dir:?}: {e}")))?;
 
         let target = dir.join(format!("{label_slug}.md"));
-
-        // Archive any existing file for this label before overwriting.
-        self.archive_if_exists(&dir, &label_slug, &target).await?;
-
         let body = (self.render)(state);
+
+        // Redelivery-idempotence: sink notifications can be re-emitted
+        // (checkpoint advance is best-effort, `catch_up` re-drives failed
+        // dispatches, an explicit `rebuild` re-plays the whole log). If
+        // the existing target already matches the new render, both the
+        // archive-and-rewrite steps are no-ops — running them anyway
+        // would create an `_archive/<label>.<epoch-ms>.md` copy of
+        // identical content on every redelivery, filling the archive dir
+        // with byte-for-byte duplicates.
+        //
+        // Read + compare on the "same content" path costs one extra file
+        // read per label_set; on the "changed content" path it costs one
+        // extra file read before the write it was already going to do,
+        // amortized against a rare event (labels move slowly relative to
+        // ordinary appends).
+        if let Some(existing) = read_if_exists(&target).await? {
+            if existing == body {
+                return Ok(());
+            }
+        }
+
+        // Content differs from the on-disk snapshot: archive the previous
+        // rendering before overwriting.
+        self.archive_if_exists(&dir, &label_slug, &target).await?;
         write_atomic(&target, &body).await
     }
 

@@ -1738,3 +1738,159 @@ async fn read_by_meta_matches_json_null() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].seq, Seq(1));
 }
+
+// ---- incremental fold in catch_up (issue #14 sub-C) ---------------------
+
+/// Wraps a `CacheBackend` and counts how often `nearest` — the read that
+/// `state_at` uses for its cache-nearest bootstrap — is called. Every call
+/// is delegated to the inner backend, so behavior is unchanged; the
+/// counter just observes traffic.
+struct CountingCache {
+    inner: MemCacheBackend,
+    nearest_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ai_store_core::CacheBackend for CountingCache {
+    async fn put(
+        &self,
+        stream: &StreamId,
+        at: Seq,
+        state: &Value,
+    ) -> Result<(), StoreError> {
+        self.inner.put(stream, at, state).await
+    }
+    async fn nearest(
+        &self,
+        stream: &StreamId,
+        at: Seq,
+    ) -> Result<Option<(Seq, Value)>, StoreError> {
+        self.nearest_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.nearest(stream, at).await
+    }
+    async fn prune(
+        &self,
+        stream: &StreamId,
+        keep_latest: usize,
+    ) -> Result<(), StoreError> {
+        self.inner.prune(stream, keep_latest).await
+    }
+}
+
+/// A sink that records the `(seq, state)` pair each `commit` delivered.
+/// Assertion target for the fold-correctness test below.
+struct RecordStateSink {
+    id: String,
+    seen: StdMutex<Vec<(Seq, Value)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for RecordStateSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        _stream: &StreamId,
+        seq: Seq,
+        state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        self.seen.lock().unwrap().push((seq, state.clone()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn catch_up_bootstraps_state_at_most_once_per_stream() {
+    // 40 events with cache_stride = 0 (never cache): the pre-fix
+    // implementation called `state_at` — and therefore `cache.nearest` —
+    // once per event dispatched, so this test would see 40 hits. The fold
+    // implementation bootstraps at the first event and then applies each
+    // subsequent patch onto the running state without touching the cache
+    // again.
+    let nearest_calls = Arc::new(AtomicUsize::new(0));
+    let cache = CountingCache {
+        inner: MemCacheBackend::new(),
+        nearest_calls: nearest_calls.clone(),
+    };
+
+    // Build 40 events on one stream with no sink attached, then attach a
+    // fresh sink and drive it via rebuild (reset checkpoints → same
+    // catch_up cost model, one clean measurement).
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(cache);
+    let store_no_sink = Store::new(
+        events.clone(),
+        cache.clone(),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig {
+            cache_stride: 0,
+            ..StoreConfig::default()
+        },
+    );
+    let s = StreamId::new("doc");
+    store_no_sink
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    for i in 2..=40u64 {
+        store_no_sink
+            .append(
+                &s,
+                "bump",
+                patch(json!([{ "op": "replace", "path": "/n", "value": i }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Reset the counter so we only measure the catch_up loop, not the
+    // (irrelevant) reads that happened during setup.
+    nearest_calls.store(0, Ordering::SeqCst);
+
+    let sink = Arc::new(RecordStateSink {
+        id: "record".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        events,
+        cache.clone(),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig {
+            cache_stride: 0,
+            ..StoreConfig::default()
+        },
+    );
+    let report = store.rebuild("record").await.unwrap();
+    assert_eq!(report.applied, 40);
+    assert_eq!(report.failed, 0);
+
+    let hits = nearest_calls.load(Ordering::SeqCst);
+    // Two batches of 32 events each, each starting a fresh
+    // `running_state` (the `while cursor < head` loop restarts the take
+    // pattern), so we tolerate up to 2 bootstraps for a 40-event stream.
+    // The pre-fix quadratic behavior would give >= 40 hits.
+    assert!(
+        hits <= 2,
+        "catch_up should bootstrap state at most once per batch \
+         (got {hits} cache.nearest calls)"
+    );
+
+    // Correctness: sink saw the right state at every seq (n = seq).
+    let seen = sink.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 40);
+    for (i, (seq, state)) in seen.iter().enumerate() {
+        let expected_seq = Seq((i + 1) as u64);
+        assert_eq!(*seq, expected_seq);
+        assert_eq!(state, &json!({ "n": (i + 1) as u64 }));
+    }
+}

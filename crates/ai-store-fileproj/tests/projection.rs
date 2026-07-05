@@ -355,3 +355,106 @@ async fn catch_up_replays_events_and_reconciles_draft_md() {
     let draft: Value = serde_json::from_str(&draft_body).unwrap();
     assert_eq!(draft, json!({ "n": 5 }));
 }
+
+// ---- label archive redelivery idempotence -------------------------------
+
+/// Count archive files matching `<label>.<...>.md` in the stream's
+/// `_archive/` directory. `0` when the directory does not exist yet.
+fn count_archived(dir: &std::path::Path, stream: &str, label: &str) -> usize {
+    let archive = dir.join(stream).join("_archive");
+    match std::fs::read_dir(&archive) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with(&format!("{label}.")) && name.ends_with(".md")
+            })
+            .count(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => panic!("read {archive:?} failed: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn redelivered_label_set_does_not_duplicate_archive_entries() {
+    let dir = TempDir::new().unwrap();
+    let (store, sink) = store_with_fileproj(dir.path());
+    let s = StreamId::new("doc");
+
+    // A single event, pinned as v1.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store.label_set(&s, &Label::new("v1"), Seq(1)).await.unwrap();
+
+    // First delivery: no archive yet (nothing was there to archive).
+    assert_eq!(count_archived(dir.path(), "doc", "v1"), 0);
+
+    // Simulate a redelivery of the same label_set. `catch_up` /
+    // `rebuild` re-drive sink notifications after a checkpoint reset
+    // or a crash; nothing about the store state has changed, so the
+    // sink is asked to render + archive the same content again.
+    //
+    // Fetch the event so we can call the sink method directly with the
+    // same inputs it received the first time.
+    let event = store.read(&s, Seq(1), 1).await.unwrap().remove(0);
+    let state = store.state_at(&s, Seq(1)).await.unwrap();
+    sink.on_label_set(&s, &Label::new("v1"), Seq(1), &state, &event)
+        .await
+        .unwrap();
+    // Redelivery: no archive entry created, no duplicated content.
+    assert_eq!(
+        count_archived(dir.path(), "doc", "v1"),
+        0,
+        "redelivered label_set must not archive identical content"
+    );
+
+    // A THIRD delivery with the same content — again idempotent.
+    sink.on_label_set(&s, &Label::new("v1"), Seq(1), &state, &event)
+        .await
+        .unwrap();
+    assert_eq!(count_archived(dir.path(), "doc", "v1"), 0);
+
+    // Now the state genuinely changes: a fresh append + re-pin, and
+    // now the archive gets exactly one entry (the previous content).
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store.label_set(&s, &Label::new("v1"), Seq(2)).await.unwrap();
+    assert_eq!(
+        count_archived(dir.path(), "doc", "v1"),
+        1,
+        "changed content should archive exactly once"
+    );
+
+    // Redeliver *the new* label_set: still one archive entry.
+    let event2 = store.read(&s, Seq(2), 1).await.unwrap().remove(0);
+    let state2 = store.state_at(&s, Seq(2)).await.unwrap();
+    sink.on_label_set(&s, &Label::new("v1"), Seq(2), &state2, &event2)
+        .await
+        .unwrap();
+    assert_eq!(
+        count_archived(dir.path(), "doc", "v1"),
+        1,
+        "redelivered changed label_set must not double-archive"
+    );
+
+    // Current v1.md reflects the latest state.
+    let current: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("doc").join("v1.md")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(current, json!({ "n": 2 }));
+}
