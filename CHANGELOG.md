@@ -19,6 +19,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.10.0] - 2026-07-05
+
+### Added
+
+- `ai-store-core`: first-class delete semantics — `TOMBSTONE_KIND` canonical
+  constant, `Store::delete()`, and `Store::streams_live()` (live-only stream
+  listing without a read model). `SqliteReadModel` defaults to hiding
+  tombstoned streams; `without_tombstone_kind()` opts out. (#10)
+- `ai-store-core` / `ai-store-sqlite`: snapshot-and-truncate compaction
+  primitive — `SNAPSHOT_KIND`, `StoreError::SeqCompacted`,
+  `EventBackend::compaction_boundary` (default `None`), gap-tolerant replay
+  in `Store::state_at`, and `SqliteMaintenance::compact_stream` running the
+  drop-triggers / delete-prefix / insert-snapshot sequence in one
+  transaction. Phase 1 of the retention story. (#11)
+- `ai-store-core` / `ai-store-sqlite`: optimistic-concurrency append —
+  `Store::append_if_head` / `EventBackend::append_if_head` (compare-and-swap
+  on the stream head) with `StoreError::HeadConflict`, plus
+  `PRAGMA busy_timeout=5000` on SQLite connections so cross-process writers
+  wait instead of surfacing `SQLITE_BUSY` immediately. (#12)
+- `ai-store-core`: failure visibility — `StoreError` gains typed `Busy` /
+  `Storage` / `Corruption` variants (`#[non_exhaustive]`, with
+  `is_retryable()`), `SinkFailureObserver` surfaces best-effort sink
+  dispatch failures, and cache growth is bounded via
+  `StoreConfig::cache_keep_latest` / `Store::prune_cache`. SQLite error
+  codes are classified into the new variants. (#13)
+- `ai-store-core`: `ProjectionSink::requires_rebuild_on_attach()` (default
+  `false`) — sinks holding in-process fold state (e.g. `CombinedFileSink`)
+  declare it, and `Store::catch_up` escalates to a rebuild once per process
+  instead of silently resuming from a head checkpoint. (#14)
+- `ai-store-sqlite`: read-model query expressiveness — `Filter` gains
+  `Gt` / `Gte` / `Lt` / `Lte` / `Not`, `Query::raw_where` (parameterized SQL
+  escape hatch), keyset pagination via `Query::after`, and
+  `query_with_count` returning page + total in one transaction. (#15)
+- `ai-store-sqlite`: `SqliteStore` registers its read model automatically —
+  `read_model()` now returns a receiving instance instead of a silently
+  unregistered one; `read_model_detached()` provides the unregistered
+  variant with its own checkpoint scope. (#15)
+- `ai-store-core`: read-time event upcasting — `Upcaster` trait +
+  `StoreBuilder::upcaster`, chain dispatched on the reserved
+  `SCHEMA_VERSION_META_KEY` meta key and applied on every read path. (#16)
+- `ai-store-core`: `Store::attach_sink()` — dynamic sink registration after
+  construction (registration precedes backfill; checkpoint gating plus the
+  idempotent-redelivery contract cover the overlap). Duplicate sink ids are
+  rejected with the new `StoreError::SinkAlreadyAttached`.
+
+### Changed
+
+- `ai-store-core` internal restructure (no public API change): the Store
+  facade is split into focused submodules, sink registry / checkpoint /
+  failure-observer state moved into a `SinkDispatcher` collaborator, and
+  upcasting is applied by an `UpcastingBackend` decorator at the event
+  backend boundary instead of per read path.
+- `ai-store-sqlite`: `SqliteStore` wires its read model through
+  `attach_sink` after construction instead of pre-registering it in the
+  builder (observable behavior unchanged).
+
+### Fixed
+
+- `ai-store-fileproj`: `CombinedFileSink` no longer silently truncates the
+  combined file after a process restart with a persisted head checkpoint —
+  the rebuild requirement is now enforced via
+  `requires_rebuild_on_attach`. (#14)
+- rustdoc: intra-doc links broken by the facade split (and pre-existing
+  private-item links) resolved; `cargo doc` is warning-free.
+
 ## [0.9.0] - 2026-07-05
 
 ### Added

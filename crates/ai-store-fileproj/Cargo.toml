@@ -11,14 +11,14 @@ homepage.workspace = true
 keywords.workspace = true
 
 [dependencies]
-ai-store-core = { path = "../ai-store-core", version = "0.9.0" }
+ai-store-core = { path = "../ai-store-core", version = "0.10.0" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-ai-store-mem = { path = "../ai-store-mem", version = "0.9.0" }
+ai-store-mem = { path = "../ai-store-mem", version = "0.10.0" }
 async-trait = { workspace = true }
 json-patch = { workspace = true }
 tempfile = "3"

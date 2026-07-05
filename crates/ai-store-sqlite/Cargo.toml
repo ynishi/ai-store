@@ -11,7 +11,7 @@ homepage.workspace = true
 keywords.workspace = true
 
 [dependencies]
-ai-store-core = { path = "../ai-store-core", version = "0.9.0" }
+ai-store-core = { path = "../ai-store-core", version = "0.10.0" }
 async-trait = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rusqlite-isle = { version = "0.4", features = ["tokio"] }
