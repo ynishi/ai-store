@@ -11,9 +11,7 @@ use ai_store_core::{
     CatchUpReport, CheckpointBackend, Event, Patch, ProjectionSink, Seq, Store, StoreConfig,
     StoreError, StreamId, Timestamp, TOMBSTONE_KIND,
 };
-use ai_store_sqlite::{
-    After, Filter, Order, Query, RawWhere, SqliteBackends, SqliteReadModel,
-};
+use ai_store_sqlite::{After, Filter, Order, Query, RawWhere, SqliteBackends, SqliteReadModel};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -706,8 +704,7 @@ async fn raw_where_composes_with_typed_filter() {
         .query(&Query {
             filter: Some(Filter::Gt("score".into(), json!(10))),
             raw_where: Some(RawWhere {
-                sql: "json_extract(state, '$.title') LIKE json_extract(?, '$')"
-                    .to_string(),
+                sql: "json_extract(state, '$.title') LIKE json_extract(?, '$')".to_string(),
                 params: vec![json!("%a%")],
             }),
             order_by: Some(("score".into(), Order::Asc)),
@@ -815,7 +812,12 @@ async fn keyset_pagination_uses_stream_as_tiebreaker_on_equal_keys() {
     ] {
         let s = StreamId::new(id);
         store
-            .append(&s, "created", set_root(json!({ "score": score })), json!({}))
+            .append(
+                &s,
+                "created",
+                set_root(json!({ "score": score })),
+                json!({}),
+            )
             .await
             .unwrap();
     }

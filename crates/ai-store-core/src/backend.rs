@@ -96,9 +96,7 @@ pub trait EventBackend: Send + Sync {
         expected_head: Seq,
     ) -> Result<Committed, StoreError> {
         let _ = (stream, rec, expected_head);
-        Err(StoreError::BackendUnsupported(
-            "append_if_head".to_string(),
-        ))
+        Err(StoreError::BackendUnsupported("append_if_head".to_string()))
     }
 
     /// Read events in `[from, from + limit)` order.
@@ -189,10 +187,7 @@ pub trait EventBackend: Send + Sync {
     /// continue to compile and behave exactly as before this method was
     /// added. Backends that ship a maintenance API (e.g.
     /// `ai_store_sqlite::SqliteMaintenance`) override it with a real lookup.
-    async fn compaction_boundary(
-        &self,
-        stream: &StreamId,
-    ) -> Result<Option<Seq>, StoreError> {
+    async fn compaction_boundary(&self, stream: &StreamId) -> Result<Option<Seq>, StoreError> {
         let _ = stream;
         Ok(None)
     }

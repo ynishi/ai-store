@@ -107,9 +107,7 @@ pub(crate) fn classify_rusqlite(e: rusqlite::Error) -> StoreError {
     use rusqlite::ErrorCode;
     match &e {
         rusqlite::Error::SqliteFailure(f, _) => match f.code {
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
-                StoreError::Busy(e.to_string())
-            }
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => StoreError::Busy(e.to_string()),
             ErrorCode::DiskFull
             | ErrorCode::PermissionDenied
             | ErrorCode::ReadOnly
@@ -122,9 +120,7 @@ pub(crate) fn classify_rusqlite(e: rusqlite::Error) -> StoreError {
         },
         rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::InvalidColumnType(..)
-        | rusqlite::Error::IntegralValueOutOfRange(..) => {
-            StoreError::Corruption(e.to_string())
-        }
+        | rusqlite::Error::IntegralValueOutOfRange(..) => StoreError::Corruption(e.to_string()),
         _ => StoreError::Backend(e.to_string()),
     }
 }
@@ -154,10 +150,10 @@ fn row_to_event(
     meta_json: String,
     at_ms: i64,
 ) -> Result<Event, StoreError> {
-    let patch: Patch = serde_json::from_str(&patch_json)
-        .map_err(|e| decode_corruption("events.patch", e))?;
-    let meta: Value = serde_json::from_str(&meta_json)
-        .map_err(|e| decode_corruption("events.meta", e))?;
+    let patch: Patch =
+        serde_json::from_str(&patch_json).map_err(|e| decode_corruption("events.patch", e))?;
+    let meta: Value =
+        serde_json::from_str(&meta_json).map_err(|e| decode_corruption("events.meta", e))?;
     Ok(Event {
         seq: Seq(seq),
         kind,
@@ -475,10 +471,7 @@ impl EventBackend for SqliteEventBackend {
         Ok(rows.into_iter().map(StreamId).collect())
     }
 
-    async fn compaction_boundary(
-        &self,
-        stream: &StreamId,
-    ) -> Result<Option<Seq>, StoreError> {
+    async fn compaction_boundary(&self, stream: &StreamId) -> Result<Option<Seq>, StoreError> {
         // Compaction (see `crate::maintenance::SqliteMaintenance`) always
         // leaves the snapshot as the earliest event on the stream: the
         // maintenance transaction deletes every row at seq <= up_to_seq and
@@ -667,8 +660,8 @@ impl CacheBackend for SqliteCacheBackend {
         match row {
             None => Ok(None),
             Some((s, json)) => {
-                let value: Value = serde_json::from_str(&json)
-                    .map_err(|e| decode_corruption("cache.state", e))?;
+                let value: Value =
+                    serde_json::from_str(&json).map_err(|e| decode_corruption("cache.state", e))?;
                 Ok(Some((Seq(s as u64), value)))
             }
         }

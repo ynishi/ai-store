@@ -88,7 +88,13 @@ async fn append_if_head_conflicts_when_a_second_writer_moved_the_head() {
 
     // Both writers agree the stream is empty (Seq::ZERO). A commits first.
     let committed_a = store_a
-        .append_if_head(&s, "init", set_root(json!({ "n": 1 })), json!({}), Seq::ZERO)
+        .append_if_head(
+            &s,
+            "init",
+            set_root(json!({ "n": 1 })),
+            json!({}),
+            Seq::ZERO,
+        )
         .await
         .unwrap();
     assert_eq!(committed_a.seq, Seq(1));
@@ -172,13 +178,7 @@ async fn append_if_head_reports_unknown_stream_as_head_conflict() {
     // The pre-flight state read surfaces UnknownStream; the facade remaps to
     // HeadConflict so the caller sees one uniform failure mode.
     let err = store
-        .append_if_head(
-            &s,
-            "init",
-            set_root(json!({ "n": 1 })),
-            json!({}),
-            Seq(5),
-        )
+        .append_if_head(&s, "init", set_root(json!({ "n": 1 })), json!({}), Seq(5))
         .await
         .unwrap_err();
     match err {
@@ -238,7 +238,13 @@ async fn append_if_head_and_append_can_be_interleaved_on_one_store() {
 
     // Start with a CAS init on an empty stream.
     store
-        .append_if_head(&s, "init", set_root(json!({ "n": 1 })), json!({}), Seq::ZERO)
+        .append_if_head(
+            &s,
+            "init",
+            set_root(json!({ "n": 1 })),
+            json!({}),
+            Seq::ZERO,
+        )
         .await
         .unwrap();
 

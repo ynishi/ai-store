@@ -101,10 +101,7 @@ impl StoreBuilder {
     /// `label_set`, `on_label_deleted` after `label_delete`). Dispatch
     /// semantics themselves are unchanged; the observer is a visibility
     /// hook. See [`SinkFailureObserver`] for the shape of the callback.
-    pub fn sink_failure_observer(
-        mut self,
-        observer: Arc<dyn SinkFailureObserver>,
-    ) -> Self {
+    pub fn sink_failure_observer(mut self, observer: Arc<dyn SinkFailureObserver>) -> Self {
         self.sink_failure_observer = Some(observer);
         self
     }

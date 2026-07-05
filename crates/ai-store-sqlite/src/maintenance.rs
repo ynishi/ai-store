@@ -154,9 +154,8 @@ impl SqliteMaintenance {
             { "op": "add", "path": "", "value": snapshot_state }
         ]))
         .map_err(to_store_err)?;
-        let snapshot_meta_json =
-            serde_json::to_string(&json!({ "compacted_at_seq": up_to_seq.0 }))
-                .map_err(to_store_err)?;
+        let snapshot_meta_json = serde_json::to_string(&json!({ "compacted_at_seq": up_to_seq.0 }))
+            .map_err(to_store_err)?;
 
         let stream_name = stream.as_str().to_string();
         let up_seq_i = up_to_seq.0 as i64;

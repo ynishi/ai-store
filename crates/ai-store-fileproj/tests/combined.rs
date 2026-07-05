@@ -209,9 +209,7 @@ async fn combined_write_is_atomic_and_content_reflects_every_stream() {
 /// instances, simulating a restart where the checkpoint table survived
 /// (e.g. `SqliteCheckpointBackend`) but every in-memory sink is fresh.
 #[derive(Default, Clone)]
-struct SharedCheckpoints(
-    Arc<std::sync::Mutex<std::collections::HashMap<(String, StreamId), Seq>>>,
-);
+struct SharedCheckpoints(Arc<std::sync::Mutex<std::collections::HashMap<(String, StreamId), Seq>>>);
 
 #[async_trait::async_trait]
 impl ai_store_core::CheckpointBackend for SharedCheckpoints {

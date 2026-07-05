@@ -93,11 +93,7 @@ impl ProjectionSink for FailingSink {
             Mode::Fail => Err(StoreError::Backend("sink refused label_set".into())),
         }
     }
-    async fn on_label_deleted(
-        &self,
-        _stream: &StreamId,
-        _label: &Label,
-    ) -> Result<(), StoreError> {
+    async fn on_label_deleted(&self, _stream: &StreamId, _label: &Label) -> Result<(), StoreError> {
         match *self.mode.lock().unwrap() {
             Mode::Pass => Ok(()),
             Mode::Fail => Err(StoreError::Backend("sink refused label_deleted".into())),
@@ -131,7 +127,12 @@ async fn observer_receives_sink_commit_failure_but_append_still_succeeds() {
     assert_eq!(committed.seq, Seq(1));
 
     let seen = observer.snapshot();
-    assert_eq!(seen.len(), 1, "expected one observer callback, got {}", seen.len());
+    assert_eq!(
+        seen.len(),
+        1,
+        "expected one observer callback, got {}",
+        seen.len()
+    );
     let failure = &seen[0];
     assert_eq!(failure.sink_id, "failing");
     assert_eq!(failure.stream, s);
@@ -209,10 +210,7 @@ async fn observer_receives_label_set_and_label_deleted_failures() {
         "expected LabelDeleted in observer log, got {ops:?}"
     );
     // The LabelDeleted callback has no seq — that field is None.
-    let deleted = seen
-        .iter()
-        .find(|f| f.op == SinkOp::LabelDeleted)
-        .unwrap();
+    let deleted = seen.iter().find(|f| f.op == SinkOp::LabelDeleted).unwrap();
     assert_eq!(deleted.seq, None);
 
     be.driver.shutdown().await.unwrap();
@@ -250,11 +248,9 @@ async fn cache_keep_latest_bounds_cache_rows_per_stream() {
     let isle = be.isle();
     let count: i64 = isle
         .call(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM cache WHERE stream = 'doc'",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM cache WHERE stream = 'doc'", [], |r| {
+                r.get(0)
+            })
         })
         .await
         .unwrap();
@@ -301,11 +297,9 @@ async fn cache_keep_latest_default_none_keeps_pre_existing_behavior() {
     let isle = be.isle();
     let count: i64 = isle
         .call(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM cache WHERE stream = 'doc'",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM cache WHERE stream = 'doc'", [], |r| {
+                r.get(0)
+            })
         })
         .await
         .unwrap();
@@ -352,11 +346,9 @@ async fn prune_cache_explicit_call_trims_to_keep_latest() {
     let isle = be.isle();
     let count: i64 = isle
         .call(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM cache WHERE stream = 'doc'",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM cache WHERE stream = 'doc'", [], |r| {
+                r.get(0)
+            })
         })
         .await
         .unwrap();

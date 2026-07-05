@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use ai_store_core::{
-    Patch, Seq, Store, StoreConfig, StoreError, StreamId, SNAPSHOT_KIND,
-};
+use ai_store_core::{Patch, Seq, Store, StoreConfig, StoreError, StreamId, SNAPSHOT_KIND};
 use ai_store_sqlite::{
     snapshot_meta_compacted_at_seq, SqliteBackends, SqliteMaintenance,
     SNAPSHOT_META_KEY_COMPACTED_AT_SEQ,
@@ -94,7 +92,10 @@ async fn compact_stream_replaces_prefix_with_a_snapshot_event() {
     assert_eq!(earliest[0].kind, SNAPSHOT_KIND);
     // The full remaining log is [snapshot@3, ev@4, ev@5].
     let all = store.read(&s, Seq(1), 100).await.unwrap();
-    assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![Seq(3), Seq(4), Seq(5)]);
+    assert_eq!(
+        all.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![Seq(3), Seq(4), Seq(5)]
+    );
 
     // state_at at and after boundary reconstruct correctly.
     assert_eq!(store.state_at(&s, Seq(3)).await.unwrap(), json!({ "n": 3 }));
@@ -120,7 +121,10 @@ async fn state_at_below_boundary_returns_seq_compacted() {
     for seq in [Seq(1), Seq(2)] {
         let err = store.state_at(&s, seq).await.unwrap_err();
         match err {
-            StoreError::SeqCompacted { boundary, requested } => {
+            StoreError::SeqCompacted {
+                boundary,
+                requested,
+            } => {
                 assert_eq!(boundary, Seq(3));
                 assert_eq!(requested, seq);
             }
@@ -186,12 +190,7 @@ async fn append_only_triggers_are_restored_after_compaction() {
     // triggers, just like before compaction ran.
     let isle = be.isle();
     let update_err = isle
-        .call(|conn| {
-            conn.execute(
-                "UPDATE events SET kind = 'tampered' WHERE seq = 4",
-                [],
-            )
-        })
+        .call(|conn| conn.execute("UPDATE events SET kind = 'tampered' WHERE seq = 4", []))
         .await
         .unwrap_err();
     assert!(
@@ -309,10 +308,7 @@ async fn compact_stream_rejects_seq_beyond_head() {
 
     append_counter(&store, &s, 3).await;
 
-    let err = maint
-        .compact_stream(&store, &s, Seq(10))
-        .await
-        .unwrap_err();
+    let err = maint.compact_stream(&store, &s, Seq(10)).await.unwrap_err();
     match err {
         StoreError::SeqOutOfRange { head, requested } => {
             assert_eq!(head, Some(Seq(3)));
@@ -331,10 +327,7 @@ async fn compact_stream_rejects_unknown_stream() {
     let maint = SqliteMaintenance::new(be.isle());
     let s = StreamId::new("does-not-exist");
 
-    let err = maint
-        .compact_stream(&store, &s, Seq(1))
-        .await
-        .unwrap_err();
+    let err = maint.compact_stream(&store, &s, Seq(1)).await.unwrap_err();
     assert!(
         matches!(err, StoreError::UnknownStream(ref sid) if sid == &s),
         "expected UnknownStream, got {err:?}"
@@ -369,11 +362,9 @@ async fn compact_stream_prunes_cache_entries_below_the_boundary() {
     let isle_before = be.isle();
     let before_count: i64 = isle_before
         .call(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM cache WHERE stream = 'doc'",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM cache WHERE stream = 'doc'", [], |r| {
+                r.get(0)
+            })
         })
         .await
         .unwrap();

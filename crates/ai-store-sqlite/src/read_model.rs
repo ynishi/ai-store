@@ -229,10 +229,7 @@ impl SqliteReadModel {
                 let rows: Vec<RawRow> = {
                     let mut stmt = tx.prepare(&query_sql)?;
                     let rows: Result<Vec<RawRow>, rusqlite::Error> = stmt
-                        .query_map(
-                            rusqlite::params_from_iter(query_params.iter()),
-                            read_row,
-                        )?
+                        .query_map(rusqlite::params_from_iter(query_params.iter()), read_row)?
                         .collect();
                     rows?
                 };
@@ -261,7 +258,12 @@ impl SqliteReadModel {
             q.include_dead,
             &mut params,
         )?;
-        apply_keyset(q.after.as_ref(), q.order_by.as_ref(), &mut where_sql, &mut params)?;
+        apply_keyset(
+            q.after.as_ref(),
+            q.order_by.as_ref(),
+            &mut where_sql,
+            &mut params,
+        )?;
         let order_sql = order_clause(q.order_by.as_ref())?;
         let sql = format!(
             "SELECT {ROW_COLUMNS} FROM read_model WHERE {where_sql} \

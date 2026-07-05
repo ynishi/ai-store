@@ -391,7 +391,10 @@ async fn redelivered_label_set_does_not_duplicate_archive_entries() {
         )
         .await
         .unwrap();
-    store.label_set(&s, &Label::new("v1"), Seq(1)).await.unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
 
     // First delivery: no archive yet (nothing was there to archive).
     assert_eq!(count_archived(dir.path(), "doc", "v1"), 0);
@@ -432,7 +435,10 @@ async fn redelivered_label_set_does_not_duplicate_archive_entries() {
         )
         .await
         .unwrap();
-    store.label_set(&s, &Label::new("v1"), Seq(2)).await.unwrap();
+    store
+        .label_set(&s, &Label::new("v1"), Seq(2))
+        .await
+        .unwrap();
     assert_eq!(
         count_archived(dir.path(), "doc", "v1"),
         1,
