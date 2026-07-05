@@ -36,6 +36,11 @@ pub struct SqliteStore {
     store: Store,
     driver: SqliteBackendDriver,
     isle: AsyncIsle,
+    /// The `SqliteReadModel` that was registered as a sink at build time.
+    /// [`SqliteStore::read_model`] returns a clone of this so consumers
+    /// see the queryable view of the same events the `Store` is
+    /// dispatching to.
+    read_model: SqliteReadModel,
 }
 
 impl SqliteStore {
@@ -108,12 +113,29 @@ impl SqliteStore {
             driver,
         } = backends;
         let checkpoints: Arc<dyn CheckpointBackend> = Arc::new(checkpoints);
-        let builder = Store::builder(Arc::new(events), Arc::new(cache)).checkpoints(checkpoints);
+        // Register a default read model as a sink at build time — the
+        // one-shot entry point (`SqliteStore::open`) has always been the
+        // path most callers reach for, and returning an unregistered read
+        // model from `.read_model()` invited a silent "query is always
+        // empty" failure mode (see the module doc). Registering here
+        // means the read model reflects every subsequent append via the
+        // ordinary sink dispatch, no extra wiring needed.
+        //
+        // Consumers that want an *un*registered read model (a separate
+        // checkpoint scope, or a read model driven manually by
+        // `materialize_to_sink`) can call `SqliteStore::read_model_detached`
+        // — that path builds a fresh instance with a distinct sink id, so
+        // it does not conflict with the one registered here.
+        let read_model = SqliteReadModel::new(isle.clone());
+        let builder = Store::builder(Arc::new(events), Arc::new(cache))
+            .checkpoints(checkpoints)
+            .sink(Arc::new(read_model.clone()));
         let store = f(builder).build();
         Self {
             store,
             driver,
             isle,
+            read_model,
         }
     }
 
@@ -124,30 +146,56 @@ impl SqliteStore {
         &self.store
     }
 
-    /// Build a [`SqliteReadModel`] sharing this `SqliteStore`'s SQLite
-    /// thread, for direct queries (`query`/`get`/`tail`/`count`).
+    /// Return a handle to the [`SqliteReadModel`] that this `SqliteStore`
+    /// registered as a `Store` sink at build time.
     ///
-    /// This does **not** register the read model as a `Store` sink — `Store`
-    /// fixes its sink list at construction time (there is no
-    /// "add a sink to an already-built `Store`" method), and by the time
-    /// this method can be called the `SqliteStore` — and the `Store` inside
-    /// it — already exists. A read model built this way stays queryable but
-    /// silent: it only reflects history you drive into it explicitly via
-    /// [`ai_store_core::Store::materialize_to_sink`] or
-    /// [`ai_store_core::Store::rebuild`] (using [`ProjectionSink::id`] as
-    /// the `sink_id`), never the automatic post-`append` dispatch a sink
-    /// registered *before* `build()` gets.
+    /// Because the read model is registered as an ordinary sink, every
+    /// subsequent [`ai_store_core::Store::append`] on this `SqliteStore`
+    /// is dispatched to it via the same post-commit path any other sink
+    /// gets — the returned handle observes appends automatically. No
+    /// explicit [`ai_store_core::Store::rebuild`] or
+    /// [`ai_store_core::Store::materialize_to_sink`] is needed for the
+    /// common one-shot case.
     ///
-    /// To wire a read model as an automatic sink from the very first write,
-    /// assemble manually via [`SqliteBackends`] + [`ai_store_core::Store::builder`]
-    /// instead of `SqliteStore` — see the crate-level "Read-model projection"
-    /// docs — since [`SqliteStore::open_with`]'s callback runs before this
-    /// store's own `AsyncIsle` handle exists on `self`, so it has no way to
-    /// hand a `SqliteReadModel` sharing *this* store's thread to itself.
+    /// Every call returns a clone of the same underlying handle (they all
+    /// share this store's `AsyncIsle`), so a caller that wants to keep a
+    /// queryable read model around alongside other work can hold onto the
+    /// return value freely.
     ///
-    /// [`ProjectionSink::id`]: ai_store_core::ProjectionSink::id
+    /// Callers that need an *un*registered read model — a separate
+    /// checkpoint scope, or an instance driven manually via
+    /// `materialize_to_sink` / `rebuild` without being fed by the write
+    /// path — should use [`SqliteStore::read_model_detached`] instead.
     pub fn read_model(&self) -> SqliteReadModel {
-        SqliteReadModel::new(self.isle.clone())
+        self.read_model.clone()
+    }
+
+    /// Return a fresh, **un**registered [`SqliteReadModel`] sharing this
+    /// store's SQLite thread but not wired into the sink dispatch path.
+    ///
+    /// The returned handle carries a distinct sink id
+    /// (`"read-model:detached"`) so it can coexist with the one
+    /// [`SqliteStore::read_model`] returns without checkpoint collisions.
+    /// A detached read model only reflects history that a caller drives
+    /// into it explicitly through
+    /// [`ai_store_core::Store::materialize_to_sink`] or
+    /// [`ai_store_core::Store::rebuild`] (using
+    /// [`ai_store_core::ProjectionSink::id`] as the `sink_id`) — automatic
+    /// post-`append` dispatch never touches it.
+    ///
+    /// Reach for this in three cases:
+    ///
+    /// - A view of only a subset of the log's history (drive
+    ///   `materialize_to_sink` for the streams the consumer cares about).
+    /// - A checkpoint scope independent of the auto-registered read
+    ///   model's — e.g. a separate consumer that wants to drive queries
+    ///   from a different lag position.
+    /// - Building a `SqliteReadModel` for use outside a `SqliteStore`
+    ///   context (though [`crate::SqliteBackends::isle`] + a manual
+    ///   [`ai_store_core::Store::builder`] assembly is usually cleaner for
+    ///   that use case).
+    pub fn read_model_detached(&self) -> SqliteReadModel {
+        SqliteReadModel::new(self.isle.clone()).with_id("read-model:detached")
     }
 
     /// Drain queued jobs and join the SQLite thread — the graceful shutdown

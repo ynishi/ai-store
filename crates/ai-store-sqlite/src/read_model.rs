@@ -102,6 +102,13 @@ pub enum Order {
 /// doubled dot) and rejected with `StoreError::Backend` otherwise — this is
 /// the SQL-injection guard: every value (and every validated path) is bound
 /// as a query parameter, never interpolated into the SQL string.
+///
+/// `Filter` covers the common shortcuts (equality, membership, string
+/// match, boolean composition, negation, range comparison). Queries that
+/// need something outside this vocabulary — full-text search operators,
+/// JSON path functions, custom SQL — should reach for
+/// [`Query::raw_where`], which lets a caller drop in a parameterized `WHERE`
+/// fragment without having to grow this enum forever.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     /// `state.<field> == value`.
@@ -111,10 +118,78 @@ pub enum Filter {
     /// `state.<field> LIKE pattern` (SQL `LIKE` semantics; intended for
     /// string-typed fields).
     Like(String, String),
+    /// `state.<field> > value`. Both operands are compared under SQLite's
+    /// [`json_extract`] semantics: numbers compare numerically, strings
+    /// lexicographically, mixed types return no match (the row is silently
+    /// filtered out rather than erroring — matching how JSON's
+    /// heterogeneous comparison degrades).
+    ///
+    /// [`json_extract`]: https://www.sqlite.org/json1.html#the_json_extract_function
+    Gt(String, Value),
+    /// `state.<field> >= value`. See [`Filter::Gt`] for comparison
+    /// semantics.
+    Gte(String, Value),
+    /// `state.<field> < value`. See [`Filter::Gt`] for comparison
+    /// semantics.
+    Lt(String, Value),
+    /// `state.<field> <= value`. See [`Filter::Gt`] for comparison
+    /// semantics.
+    Lte(String, Value),
+    /// Negation of a sub-filter.
+    Not(Box<Filter>),
     /// Conjunction of sub-filters (`true` for an empty list).
     And(Vec<Filter>),
     /// Disjunction of sub-filters (`false` for an empty list).
     Or(Vec<Filter>),
+}
+
+/// Parameterized `WHERE`-clause fragment (see [`Query::raw_where`]).
+#[derive(Debug, Clone)]
+pub struct RawWhere {
+    /// SQL fragment interpolated verbatim into the compiled `WHERE`
+    /// clause. Must NOT contain user-supplied literals: substitute each
+    /// value with a `?` placeholder and put the value in [`RawWhere::params`].
+    /// Use `state` as the table alias for `json_extract`; the read-model's
+    /// own columns (`stream`, `last_seq`, `updated_at`, `live`) are
+    /// available unqualified.
+    ///
+    /// ## Comparing bound params to primitive columns
+    ///
+    /// [`RawWhere::params`] is serialized through the same
+    /// `serde_json::to_string` path every typed [`Filter`] comparison
+    /// uses — each value is bound as its JSON literal (a numeric `10`
+    /// binds as `"10"`, the string `"foo"` binds as `"\"foo\""`). When
+    /// comparing against `json_extract(state, '$.field)`'s JSON-typed
+    /// output that just works; when comparing against a plain string
+    /// column, wrap the placeholder with `json_extract(?, '$')` to
+    /// unwrap the JSON quoting on the SQL side. The typed comparison
+    /// builders already do this — see the string range example in
+    /// [`Filter::Gt`]'s rustdoc for the same pattern.
+    pub sql: String,
+    /// Bind parameters, in `?`-placeholder order. `serde_json::Value` covers
+    /// numbers, strings, booleans, arrays, and null — enough for every
+    /// case a caller not writing raw SQL would express through [`Filter`].
+    pub params: Vec<Value>,
+}
+
+/// Value + tie-breaker used for keyset pagination (see [`Query::after`]).
+///
+/// A caller reads page N by re-issuing the same [`Query`] with
+/// `after = Some((<last row's order_by value>, <last row's stream id>))`.
+/// The stream id is the tie-breaker for orderings that are not unique
+/// (`updated_at`, `live`, or any `state.<field>` that can repeat) — without
+/// it, two rows with the same order-by value can flip past each other from
+/// page to page, silently dropping or duplicating rows.
+#[derive(Debug, Clone)]
+pub struct After {
+    /// The last row's value under the effective `order_by` expression (a
+    /// [`serde_json::Value`] so it works uniformly across numeric-typed and
+    /// string-typed keys). For the default `updated_at DESC` sort this is
+    /// a `Number(i64)`.
+    pub order_value: Value,
+    /// The last row's [`StreamId`] (used only when two rows share
+    /// `order_value`; unique per row, so a tie-break is decisive).
+    pub stream: StreamId,
 }
 
 /// A query against the read-model table.
@@ -122,15 +197,39 @@ pub enum Filter {
 pub struct Query {
     /// Predicate to apply. `None` matches every row.
     pub filter: Option<Filter>,
+    /// Additional parameterized `WHERE` fragment, `AND`-ed with `filter`
+    /// (and with the `live = 1` constraint, when `include_dead = false`).
+    ///
+    /// Reach for this when a query cannot be expressed through the
+    /// [`Filter`] variants — e.g. full-text search operators, JSON path
+    /// functions the crate does not expose, backend-specific operators.
+    /// The fragment is spliced into the compiled SQL literally, so it
+    /// must never contain user-supplied literals; put those in
+    /// [`RawWhere::params`].
+    pub raw_where: Option<RawWhere>,
     /// Sort key. `None` defaults to `updated_at DESC`.
     ///
     /// The field name may be one of the read-model's own columns
     /// (`"updated_at"`, `"last_seq"`, `"stream"`, `"live"`) or a dotted path
     /// into `state`, following the same validation as [`Filter`].
     pub order_by: Option<(String, Order)>,
+    /// Keyset pagination cursor — see [`After`].
+    ///
+    /// Preferred over `offset`-based pagination for stability on updated
+    /// tables: rows re-sorted between page reads never cause a
+    /// keyset-paginated query to skip or repeat rows the way an
+    /// `OFFSET`-paginated one can. Combine with any `filter` /
+    /// `raw_where` — `after` is applied as an extra `AND` predicate.
+    ///
+    /// When both `after` and `offset` are set, both apply — but that
+    /// combination is unusual and typically indicates a bug in the
+    /// caller. Prefer one or the other.
+    pub after: Option<After>,
     /// Maximum rows to return.
     pub limit: usize,
-    /// Rows to skip before `limit` is applied.
+    /// Rows to skip before `limit` is applied. Kept for callers that
+    /// have not yet migrated to [`Query::after`]; prefer keyset
+    /// pagination for stable page boundaries.
     pub offset: usize,
     /// Include tombstoned (`live = 0`) rows. Defaults to `false` in
     /// [`Query::default`].
@@ -141,7 +240,9 @@ impl Default for Query {
     fn default() -> Self {
         Self {
             filter: None,
+            raw_where: None,
             order_by: None,
+            after: None,
             limit: 100,
             offset: 0,
             include_dead: false,
@@ -173,6 +274,24 @@ fn json_param(value: &Value) -> Result<SqlValue, StoreError> {
     serde_json::to_string(value)
         .map(SqlValue::Text)
         .map_err(|e| StoreError::Backend(format!("encode read-model filter value: {e}")))
+}
+
+/// Shared SQL builder for the range-comparison filter variants (`Gt` /
+/// `Gte` / `Lt` / `Lte`). `op` is the SQLite binary operator that goes
+/// between the two `json_extract` calls.
+fn build_compare(
+    field: &str,
+    value: &Value,
+    op: &str,
+    params: &mut Vec<SqlValue>,
+) -> Result<String, StoreError> {
+    validate_field_path(field)?;
+    let path = format!("$.{field}");
+    params.push(SqlValue::Text(path));
+    params.push(json_param(value)?);
+    Ok(format!(
+        "json_extract(state, ?) {op} json_extract(?, '$')"
+    ))
 }
 
 /// Build the SQL fragment for one `Filter`, appending its bind parameters (in
@@ -209,6 +328,14 @@ fn build_filter(filter: &Filter, params: &mut Vec<SqlValue>) -> Result<String, S
             params.push(SqlValue::Text(pattern.clone()));
             Ok("json_extract(state, ?) LIKE ?".to_string())
         }
+        Filter::Gt(field, value) => build_compare(field, value, ">", params),
+        Filter::Gte(field, value) => build_compare(field, value, ">=", params),
+        Filter::Lt(field, value) => build_compare(field, value, "<", params),
+        Filter::Lte(field, value) => build_compare(field, value, "<=", params),
+        Filter::Not(inner) => {
+            let inner_sql = build_filter(inner, params)?;
+            Ok(format!("NOT ({inner_sql})"))
+        }
         Filter::And(filters) => {
             if filters.is_empty() {
                 return Ok("1".to_string());
@@ -232,10 +359,13 @@ fn build_filter(filter: &Filter, params: &mut Vec<SqlValue>) -> Result<String, S
     }
 }
 
-/// Combine an optional user [`Filter`] with the `live` constraint implied by
-/// `include_dead` into one `WHERE`-clause body.
+/// Combine an optional user [`Filter`], an optional raw `WHERE` fragment,
+/// and the `live` constraint implied by `include_dead` into one
+/// `WHERE`-clause body. Parameters accumulate in `params` in the order they
+/// appear in the returned SQL.
 fn build_where(
     filter: Option<&Filter>,
+    raw: Option<&RawWhere>,
     include_dead: bool,
     params: &mut Vec<SqlValue>,
 ) -> Result<String, StoreError> {
@@ -243,10 +373,75 @@ fn build_where(
         Some(f) => build_filter(f, params)?,
         None => "1".to_string(),
     };
+    let with_raw = match raw {
+        Some(r) => {
+            // Splice raw params AFTER the filter params in the same order
+            // the ?-placeholders appear in the final compiled string, so
+            // rusqlite binds them correctly.
+            for v in &r.params {
+                params.push(json_param(v)?);
+            }
+            format!("({filter_sql}) AND ({})", r.sql)
+        }
+        None => filter_sql,
+    };
     if include_dead {
-        Ok(filter_sql)
+        Ok(with_raw)
     } else {
-        Ok(format!("({filter_sql}) AND live = 1"))
+        Ok(format!("({with_raw}) AND live = 1"))
+    }
+}
+
+/// Append the keyset-pagination `AND` predicate to `where_body` when the
+/// query carries an [`After`] cursor. Uses the effective `order_by` expr
+/// (already computed by [`order_clause`]) as the left-hand side of the
+/// comparison so tie-breaking on `stream` uses the same key.
+fn apply_keyset(
+    after: Option<&After>,
+    order_by: Option<&(String, Order)>,
+    where_body: &mut String,
+    params: &mut Vec<SqlValue>,
+) -> Result<(), StoreError> {
+    let Some(after) = after else {
+        return Ok(());
+    };
+    let (expr, direction) = order_expr_and_direction(order_by)?;
+    let cmp = match direction {
+        Order::Asc => ">",
+        Order::Desc => "<",
+    };
+    // Serialize the cursor's order value once, bind it twice (the SQL
+    // fragment references it in both the strict-greater-than case and
+    // the equality-then-stream-tiebreaker case).
+    let order_value_json = json_param(&after.order_value)?;
+    params.push(order_value_json.clone());
+    params.push(order_value_json);
+    params.push(SqlValue::Text(after.stream.as_str().to_string()));
+    let fragment = format!(
+        "(({expr}) {cmp} json_extract(?, '$') OR \
+          (({expr}) = json_extract(?, '$') AND stream {cmp} ?))"
+    );
+    where_body.push_str(" AND ");
+    where_body.push_str(&fragment);
+    Ok(())
+}
+
+/// Return the SQL expression + effective sort direction for `order_by`
+/// (defaulting to `updated_at DESC`), factored out so keyset pagination
+/// can reference the same expression [`order_clause`] emits.
+fn order_expr_and_direction(
+    order_by: Option<&(String, Order)>,
+) -> Result<(String, Order), StoreError> {
+    match order_by {
+        None => Ok(("updated_at".to_string(), Order::Desc)),
+        Some((field, order)) => {
+            validate_field_path(field)?;
+            let expr = match field.as_str() {
+                "updated_at" | "last_seq" | "stream" | "live" => field.clone(),
+                _ => format!("json_extract(state, '$.{field}')"),
+            };
+            Ok((expr, *order))
+        }
     }
 }
 
@@ -363,16 +558,7 @@ impl SqliteReadModel {
 
     /// Run `q` against the read-model table.
     pub async fn query(&self, q: &Query) -> Result<Vec<ReadModelRow>, StoreError> {
-        let mut params: Vec<SqlValue> = Vec::new();
-        let where_sql = build_where(q.filter.as_ref(), q.include_dead, &mut params)?;
-        let order_sql = order_clause(q.order_by.as_ref())?;
-        let sql = format!(
-            "SELECT {ROW_COLUMNS} FROM read_model WHERE {where_sql} \
-             ORDER BY {order_sql} LIMIT ? OFFSET ?"
-        );
-        params.push(SqlValue::Integer(q.limit as i64));
-        params.push(SqlValue::Integer(q.offset as i64));
-
+        let (sql, params) = self.build_query_sql(q)?;
         let rows: Vec<RawRow> = self
             .isle
             .call(move |conn| {
@@ -388,16 +574,96 @@ impl SqliteReadModel {
         rows.into_iter().map(row_to_read_model_row).collect()
     }
 
+    /// Run `q` against the read-model table AND return the total row count
+    /// that would have matched without `limit` / `offset` / `after`, in a
+    /// single SQLite transaction.
+    ///
+    /// Useful for paginated UIs that need `(page_rows, total_matching)` as
+    /// one consistent snapshot — issuing a separate `query` and `count` can
+    /// let a concurrent writer's commit land between the two, silently
+    /// shifting the total under the page.
+    pub async fn query_with_count(
+        &self,
+        q: &Query,
+    ) -> Result<(Vec<ReadModelRow>, u64), StoreError> {
+        let (query_sql, query_params) = self.build_query_sql(q)?;
+        let (count_sql, count_params) =
+            self.build_count_sql(q.filter.as_ref(), q.raw_where.as_ref(), q.include_dead)?;
+
+        let (rows, count): (Vec<RawRow>, i64) = self
+            .isle
+            .call(move |conn| {
+                // Wrapping both statements in a DEFERRED transaction pins
+                // them to one SQLite snapshot — no other writer can commit
+                // between them.
+                let tx = conn.transaction()?;
+                let rows: Vec<RawRow> = {
+                    let mut stmt = tx.prepare(&query_sql)?;
+                    let rows: Result<Vec<RawRow>, rusqlite::Error> = stmt
+                        .query_map(
+                            rusqlite::params_from_iter(query_params.iter()),
+                            read_row,
+                        )?
+                        .collect();
+                    rows?
+                };
+                let count: i64 = tx.query_row(
+                    &count_sql,
+                    rusqlite::params_from_iter(count_params.iter()),
+                    |r| r.get(0),
+                )?;
+                tx.commit()?;
+                Ok((rows, count))
+            })
+            .await
+            .map_err(from_isle_err)?;
+
+        let out_rows: Result<Vec<_>, _> = rows.into_iter().map(row_to_read_model_row).collect();
+        Ok((out_rows?, count as u64))
+    }
+
+    /// Build the SQL string + bind parameters for a `SELECT` query — shared
+    /// by [`SqliteReadModel::query`] and [`SqliteReadModel::query_with_count`].
+    fn build_query_sql(&self, q: &Query) -> Result<(String, Vec<SqlValue>), StoreError> {
+        let mut params: Vec<SqlValue> = Vec::new();
+        let mut where_sql = build_where(
+            q.filter.as_ref(),
+            q.raw_where.as_ref(),
+            q.include_dead,
+            &mut params,
+        )?;
+        apply_keyset(q.after.as_ref(), q.order_by.as_ref(), &mut where_sql, &mut params)?;
+        let order_sql = order_clause(q.order_by.as_ref())?;
+        let sql = format!(
+            "SELECT {ROW_COLUMNS} FROM read_model WHERE {where_sql} \
+             ORDER BY {order_sql} LIMIT ? OFFSET ?"
+        );
+        params.push(SqlValue::Integer(q.limit as i64));
+        params.push(SqlValue::Integer(q.offset as i64));
+        Ok((sql, params))
+    }
+
+    /// Build the SQL string + bind parameters for a `COUNT(*)` — shared by
+    /// [`SqliteReadModel::count`] and [`SqliteReadModel::query_with_count`].
+    fn build_count_sql(
+        &self,
+        filter: Option<&Filter>,
+        raw: Option<&RawWhere>,
+        include_dead: bool,
+    ) -> Result<(String, Vec<SqlValue>), StoreError> {
+        let mut params: Vec<SqlValue> = Vec::new();
+        let where_sql = build_where(filter, raw, include_dead, &mut params)?;
+        let sql = format!("SELECT COUNT(*) FROM read_model WHERE {where_sql}");
+        Ok((sql, params))
+    }
+
     /// Count rows matching `filter` (or every row when `filter` is `None`).
     pub async fn count(
         &self,
         filter: Option<&Filter>,
         include_dead: bool,
     ) -> Result<u64, StoreError> {
-        let mut params: Vec<SqlValue> = Vec::new();
-        let where_sql = build_where(filter, include_dead, &mut params)?;
-        let sql = format!("SELECT COUNT(*) FROM read_model WHERE {where_sql}");
-
+        let (sql, params) = self.build_count_sql(filter, None, include_dead)?;
         let count: i64 = self
             .isle
             .call(move |conn| {

@@ -11,7 +11,9 @@ use ai_store_core::{
     CatchUpReport, CheckpointBackend, Event, Patch, ProjectionSink, Seq, Store, StoreConfig,
     StoreError, StreamId, Timestamp, TOMBSTONE_KIND,
 };
-use ai_store_sqlite::{Filter, Order, Query, SqliteBackends, SqliteReadModel};
+use ai_store_sqlite::{
+    After, Filter, Order, Query, RawWhere, SqliteBackends, SqliteReadModel,
+};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -551,6 +553,326 @@ async fn opening_an_existing_v2_database_lands_the_read_model_table() {
     // Would error (`no such table: read_model`) if migration 3 had not run.
     let rows = rm.query(&Query::default()).await.unwrap();
     assert!(rows.is_empty());
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- issue #15 sub-A: extended Filter variants -----------------------
+
+async fn seed_scored_streams(store: &Store, rm: &SqliteReadModel) {
+    for (id, score, title) in [
+        ("doc-1", 10, "alpha"),
+        ("doc-2", 20, "beta"),
+        ("doc-3", 30, "gamma"),
+        ("doc-4", 40, "delta"),
+    ] {
+        let s = StreamId::new(id);
+        store
+            .append(
+                &s,
+                "created",
+                set_root(json!({ "score": score, "title": title })),
+                json!({}),
+            )
+            .await
+            .unwrap();
+    }
+    store.catch_up(rm.id()).await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_gt_and_gte_on_numeric_field() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    let gt = rm
+        .query(&Query {
+            filter: Some(Filter::Gt("score".into(), json!(20))),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = gt.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-3", "doc-4"]);
+
+    let gte = rm
+        .query(&Query {
+            filter: Some(Filter::Gte("score".into(), json!(20))),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = gte.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-2", "doc-3", "doc-4"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_lt_and_lte_on_numeric_field() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    let lt = rm
+        .query(&Query {
+            filter: Some(Filter::Lt("score".into(), json!(30))),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = lt.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-1", "doc-2"]);
+
+    let lte = rm
+        .query(&Query {
+            filter: Some(Filter::Lte("score".into(), json!(30))),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = lte.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-1", "doc-2", "doc-3"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_range_on_string_field_is_lexicographic() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    // Lexicographic comparison: "beta" < "delta" < "gamma", so title > "beta"
+    // is {"delta", "gamma"} — "alpha" is even less, filtered out.
+    let rows = rm
+        .query(&Query {
+            filter: Some(Filter::Gt("title".into(), json!("beta"))),
+            order_by: Some(("title".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let titles: Vec<String> = rows
+        .iter()
+        .map(|r| r.state["title"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(titles, vec!["delta", "gamma"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_not_negates_sub_filter() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    // NOT (score == 20) — drops doc-2.
+    let rows = rm
+        .query(&Query {
+            filter: Some(Filter::Not(Box::new(Filter::Eq("score".into(), json!(20))))),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-1", "doc-3", "doc-4"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- issue #15 sub-A: raw_where escape hatch ------------------------
+
+#[tokio::test]
+async fn raw_where_composes_with_typed_filter() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    // `raw_where.params` bind through the same `json_param` path the
+    // typed `Filter` builders use — each value is serialized to a JSON
+    // literal and bound as text. To compare a bound param to a plain
+    // string on the SQL side, unwrap it with
+    // `json_extract(?, '$')` (mirroring how the typed comparisons
+    // above render).
+    let rows = rm
+        .query(&Query {
+            filter: Some(Filter::Gt("score".into(), json!(10))),
+            raw_where: Some(RawWhere {
+                sql: "json_extract(state, '$.title') LIKE json_extract(?, '$')"
+                    .to_string(),
+                params: vec![json!("%a%")],
+            }),
+            order_by: Some(("score".into(), Order::Asc)),
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    // score > 10 AND title matches %a%: beta / gamma / delta — all
+    // contain "a". doc-2 (beta, score=20), doc-3 (gamma, score=30),
+    // doc-4 (delta, score=40).
+    let ids: Vec<&str> = rows.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-2", "doc-3", "doc-4"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- issue #15 sub-A: keyset pagination -----------------------------
+
+#[tokio::test]
+async fn keyset_pagination_asc_walks_stable_pages() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    // Page 1: two rows in asc order.
+    let page1 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Asc)),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page1.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-1", "doc-2"]);
+
+    // Page 2: use the last row of page 1 as the cursor.
+    let last = &page1[page1.len() - 1];
+    let page2 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Asc)),
+            after: Some(After {
+                order_value: last.state["score"].clone(),
+                stream: last.stream.clone(),
+            }),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page2.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-3", "doc-4"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keyset_pagination_desc_walks_stable_pages() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    let page1 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Desc)),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page1.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-4", "doc-3"]);
+
+    let last = &page1[page1.len() - 1];
+    let page2 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Desc)),
+            after: Some(After {
+                order_value: last.state["score"].clone(),
+                stream: last.stream.clone(),
+            }),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page2.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-2", "doc-1"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keyset_pagination_uses_stream_as_tiebreaker_on_equal_keys() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+
+    // Two streams share the same score — the tiebreaker on `stream` must
+    // keep pagination stable.
+    for (id, score) in [
+        ("a-doc-1", 10),
+        ("a-doc-2", 10),
+        ("a-doc-3", 10),
+        ("b-doc", 20),
+    ] {
+        let s = StreamId::new(id);
+        store
+            .append(&s, "created", set_root(json!({ "score": score })), json!({}))
+            .await
+            .unwrap();
+    }
+    store.catch_up(rm.id()).await.unwrap();
+
+    let page1 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Asc)),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page1.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["a-doc-1", "a-doc-2"]);
+
+    let last = &page1[page1.len() - 1];
+    let page2 = rm
+        .query(&Query {
+            order_by: Some(("score".into(), Order::Asc)),
+            after: Some(After {
+                order_value: last.state["score"].clone(),
+                stream: last.stream.clone(),
+            }),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    // Next page picks up a-doc-3 (same score, later stream), then b-doc.
+    let ids: Vec<&str> = page2.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["a-doc-3", "b-doc"]);
+
+    be.driver.shutdown().await.unwrap();
+}
+
+// ---- issue #15 sub-A optional: query_with_count -----------------------
+
+#[tokio::test]
+async fn query_with_count_returns_page_and_total_atomically() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let (store, rm) = store_with_read_model(&be).await;
+    seed_scored_streams(&store, &rm).await;
+
+    let (page, total) = rm
+        .query_with_count(&Query {
+            filter: Some(Filter::Gt("score".into(), json!(10))),
+            order_by: Some(("score".into(), Order::Asc)),
+            limit: 2,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    // 3 matching rows total (doc-2, doc-3, doc-4), page limited to 2.
+    let ids: Vec<&str> = page.iter().map(|r| r.stream.as_str()).collect();
+    assert_eq!(ids, vec!["doc-2", "doc-3"]);
+    assert_eq!(total, 3);
 
     be.driver.shutdown().await.unwrap();
 }

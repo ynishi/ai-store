@@ -156,5 +156,5 @@ pub use maintenance::{
     snapshot_meta_compacted_at_seq, CompactionReport, SqliteMaintenance,
     SNAPSHOT_META_KEY_COMPACTED_AT_SEQ,
 };
-pub use read_model::{Filter, Order, Query, ReadModelRow, SqliteReadModel};
+pub use read_model::{After, Filter, Order, Query, RawWhere, ReadModelRow, SqliteReadModel};
 pub use store::SqliteStore;

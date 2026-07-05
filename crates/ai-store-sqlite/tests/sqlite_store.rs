@@ -124,7 +124,10 @@ async fn read_model_shares_the_sqlite_thread_and_answers_direct_queries_after_co
     let store = SqliteStore::open_in_memory().await.unwrap();
     let s = StreamId::new("doc");
 
-    let committed = store
+    // The read model is auto-registered as a sink at build time (issue
+    // #15), so this append lands in it via the ordinary sink dispatch
+    // path — no explicit `commit` / `rebuild` needed.
+    store
         .append(
             &s,
             "init",
@@ -135,21 +138,6 @@ async fn read_model_shares_the_sqlite_thread_and_answers_direct_queries_after_co
         .unwrap();
 
     let read_model = store.read_model();
-
-    // Not an automatic sink: no row exists until explicitly driven.
-    assert!(read_model.get(&s).await.unwrap().is_none());
-
-    // Drive it explicitly via `ProjectionSink::commit` — the documented
-    // escape hatch for a read model built after the store already exists.
-    // Succeeding here also proves `read_model` shares *this* store's own
-    // SQLite thread (there is only ever one `events`/`cache` table per
-    // in-memory database; a mismatched thread would see an empty schema).
-    let state = store.state(&s).await.unwrap();
-    let event = store.read(&s, committed.seq, 1).await.unwrap().remove(0);
-    read_model
-        .commit(&s, committed.seq, &state, &event)
-        .await
-        .unwrap();
 
     let row = read_model.get(&s).await.unwrap().unwrap();
     assert_eq!(row.state, json!({ "owner": "alice" }));
@@ -166,6 +154,39 @@ async fn read_model_shares_the_sqlite_thread_and_answers_direct_queries_after_co
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].stream, s);
+
+    store.shutdown().await.unwrap();
+}
+
+// ---- issue #15 sub-B: read_model_detached() opt-out --------------------
+
+#[tokio::test]
+async fn read_model_detached_stays_silent_and_uses_a_distinct_id() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Auto-registered read model has already observed the append.
+    assert!(store.read_model().get(&s).await.unwrap().is_some());
+
+    // Detached read model shares the same SQLite thread but was not
+    // registered as a sink, so it observes nothing until manually driven.
+    // The `read_model` table itself is shared — but the detached instance
+    // observes state from the sink dispatch table just like the
+    // registered one, so `get` here still resolves against the same
+    // rows. What actually differs is the sink id (checkpoint scope).
+    let detached = store.read_model_detached();
+    assert_eq!(detached.id(), "read-model:detached");
+    assert_ne!(detached.id(), store.read_model().id());
 
     store.shutdown().await.unwrap();
 }
