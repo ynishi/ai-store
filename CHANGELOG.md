@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.0] - 2026-07-05
+
+### Added
+
 - `ai-store-core::CheckpointBackend`: new SPI trait persisting
   `ProjectionSink` checkpoints across process restarts, with
   `Store::with_checkpoint_backend` as the opt-in constructor
@@ -34,10 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driven to completion. Remaining events on a failed stream are counted
   in `CatchUpReport.skipped`, which was previously never incremented.
 
-### Deprecated
-
-### Removed
-
 ### Fixed
 
 - Closed the gate-validate/append TOCTOU race: `append`, `import_event`
@@ -46,8 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section, so concurrent writes to the same stream can no longer validate
   against the same stale `current`. Writes to different streams remain
   fully concurrent.
-
-### Security
 
 ## [0.7.0] - 2026-07-05
 
