@@ -1,20 +1,85 @@
-//! Sink lifecycle: `materialize_to_sink` / `catch_up` / `rebuild` /
-//! `catch_up_inner`.
+//! Sink lifecycle: `attach_sink` / `materialize_to_sink` / `catch_up` /
+//! `rebuild` / `catch_up_inner`.
 //!
 //! `catch_up_inner` is the shared driver `catch_up` and `rebuild` both call
 //! (with `reset` selecting whether checkpoints are zeroed first) — see
 //! [`super::Store`]'s module-level rustdoc for how sink dispatch fits into
 //! the overall write pipeline.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use crate::error::StoreError;
 use crate::id::{Seq, StreamId};
-use crate::sink::{CatchUpFailure, CatchUpReport};
+use crate::sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
 
 use super::Store;
 
 impl Store {
+    /// Register `sink` on this store and bring it up to date with every
+    /// stream's current history in one call.
+    ///
+    /// This is the dynamic counterpart to [`crate::StoreBuilder::sink`]: the
+    /// builder method fixes the sink list at construction time, while
+    /// `attach_sink` lets a caller add a [`ProjectionSink`] to an
+    /// already-running `Store` — the shape most consumers actually need
+    /// (open a store, hand out a handle, then let a caller-supplied
+    /// projection opt in later without reconstructing the store around it).
+    ///
+    /// Returns [`StoreError::SinkAlreadyAttached`] if a sink with the same
+    /// [`ProjectionSink::id`] is already registered (whether from
+    /// [`crate::StoreBuilder::sink`] or an earlier `attach_sink` call) — ids
+    /// are the checkpoint key, so a collision would otherwise silently
+    /// corrupt both sinks' bookkeeping. The rejected sink is never
+    /// registered and never dispatched to.
+    ///
+    /// ## Ordering: register before backfill
+    ///
+    /// `attach_sink` registers `sink` with the dispatcher *first*, then
+    /// drives it forward with the same routine [`Store::catch_up`] uses
+    /// (including the one-shot [`ProjectionSink::requires_rebuild_on_attach`]
+    /// escalation to a full [`Store::rebuild`] — see that trait method's
+    /// rustdoc for which sinks need it). Registering before backfilling
+    /// means the live post-`append` / `label_set` / `label_delete` dispatch
+    /// path starts handing `sink` every subsequent commit *before* the
+    /// backfill below has even started reading history — so no commit that
+    /// lands after this call returns can be missed, even one racing the
+    /// backfill itself.
+    ///
+    /// A commit dispatched live while the backfill is still in flight will
+    /// not necessarily land contiguously with the sink's checkpoint (the
+    /// checkpoint only advances when the dispatched `seq` immediately
+    /// follows it — see [`crate::dispatcher::SinkDispatcher::dispatch_commit`]
+    /// — so a live dispatch that arrives ahead of the backfill's cursor
+    /// leaves the checkpoint parked and the intervening gap for the
+    /// backfill to fill in). The backfill below always runs to the head it
+    /// observes once it starts, so it closes that gap in the same call;
+    /// [`ProjectionSink::commit`]'s idempotence-under-redelivery contract
+    /// covers any event `sink` happens to see twice as a result (once via
+    /// the live path, once via backfill). The net effect: every event
+    /// committed to this store — before, during, or after this call — is
+    /// eventually delivered to `sink` at least once, with no window in
+    /// which one can be silently dropped.
+    ///
+    /// The backfill (a [`Store::catch_up`], or [`Store::rebuild`] when
+    /// [`ProjectionSink::requires_rebuild_on_attach`] returns `true`) is
+    /// isolated per stream the same way `catch_up` is — a failure on one
+    /// stream does not stop other streams from being driven to completion.
+    /// Those per-stream failures are reported through a
+    /// [`crate::CatchUpReport`], not through this method's `Result`, which
+    /// only reports registration/backend failures; a caller that needs the
+    /// full report (applied/skipped/failed counts, per-stream failure
+    /// detail) should call [`Store::catch_up`] again for `sink.id()`
+    /// immediately after a successful `attach_sink` — that follow-up call
+    /// is a cheap no-op when the backfill above already caught the sink up.
+    pub async fn attach_sink(&self, sink: Arc<dyn ProjectionSink>) -> Result<(), StoreError> {
+        let sink_id = sink.id().to_string();
+        self.dispatcher.attach(sink).await?;
+        self.catch_up(&sink_id).await?;
+        Ok(())
+    }
+
     /// Materialize `stream`'s state at `at` (or the current head when `at`
     /// is `None`) and hand it to `sink_id` immediately, without waiting for
     /// [`Store::catch_up`] to drive it.
@@ -59,6 +124,7 @@ impl Store {
         let sink = self
             .dispatcher
             .find_sink(sink_id)
+            .await
             .ok_or_else(|| StoreError::UnknownSink(sink_id.to_string()))?;
 
         let target = match at {
@@ -99,6 +165,7 @@ impl Store {
         let needs_rebuild_escalation = self
             .dispatcher
             .find_sink(sink_id)
+            .await
             .map(|s| s.requires_rebuild_on_attach())
             .unwrap_or(false)
             && !self.dispatcher.has_been_rebuilt_this_process(sink_id);
@@ -137,7 +204,7 @@ impl Store {
         sink_id: &str,
         reset: bool,
     ) -> Result<CatchUpReport, StoreError> {
-        let Some(sink) = self.dispatcher.find_sink(sink_id) else {
+        let Some(sink) = self.dispatcher.find_sink(sink_id).await else {
             return Ok(CatchUpReport::EMPTY);
         };
         let streams = self.events.streams().await?;

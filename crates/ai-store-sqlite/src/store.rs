@@ -67,7 +67,7 @@ impl SqliteStore {
         f: impl FnOnce(StoreBuilder) -> StoreBuilder,
     ) -> Result<Self, StoreError> {
         let backends = SqliteBackends::open(path).await?;
-        Ok(Self::from_backends(backends, f))
+        Self::from_backends(backends, f).await
     }
 
     /// Open an in-memory database (test / throwaway use). Equivalent to
@@ -95,13 +95,13 @@ impl SqliteStore {
         f: impl FnOnce(StoreBuilder) -> StoreBuilder,
     ) -> Result<Self, StoreError> {
         let backends = SqliteBackends::open_in_memory().await?;
-        Ok(Self::from_backends(backends, f))
+        Self::from_backends(backends, f).await
     }
 
-    fn from_backends(
+    async fn from_backends(
         backends: SqliteBackends,
         f: impl FnOnce(StoreBuilder) -> StoreBuilder,
-    ) -> Self {
+    ) -> Result<Self, StoreError> {
         // `isle` must be cloned before `backends` is destructured below —
         // `SqliteBackends::isle` borrows `self` via the `events` field it
         // still owns at this point.
@@ -113,30 +113,33 @@ impl SqliteStore {
             driver,
         } = backends;
         let checkpoints: Arc<dyn CheckpointBackend> = Arc::new(checkpoints);
-        // Register a default read model as a sink at build time — the
-        // one-shot entry point (`SqliteStore::open`) has always been the
-        // path most callers reach for, and returning an unregistered read
-        // model from `.read_model()` invited a silent "query is always
-        // empty" failure mode (see the module doc). Registering here
-        // means the read model reflects every subsequent append via the
-        // ordinary sink dispatch, no extra wiring needed.
+        let read_model = SqliteReadModel::new(isle.clone());
+        let builder = Store::builder(Arc::new(events), Arc::new(cache)).checkpoints(checkpoints);
+        let store = f(builder).build();
+        // Attach the default read model via `Store::attach_sink` rather
+        // than registering it on the builder — the one-shot entry point
+        // (`SqliteStore::open`) has always been the path most callers reach
+        // for, and returning an unregistered read model from `.read_model()`
+        // invited a silent "query is always empty" failure mode (see the
+        // module doc). `attach_sink` both registers the read model and
+        // backfills it from any history already on `store` (relevant on
+        // `SqliteStore::open` against an existing database file) before
+        // this constructor returns, so the eager, always-caught-up
+        // behavior callers depend on is unchanged — the only thing that
+        // moved is *how* the read model gets onto the dispatch path.
         //
         // Consumers that want an *un*registered read model (a separate
         // checkpoint scope, or a read model driven manually by
         // `materialize_to_sink`) can call `SqliteStore::read_model_detached`
         // — that path builds a fresh instance with a distinct sink id, so
-        // it does not conflict with the one registered here.
-        let read_model = SqliteReadModel::new(isle.clone());
-        let builder = Store::builder(Arc::new(events), Arc::new(cache))
-            .checkpoints(checkpoints)
-            .sink(Arc::new(read_model.clone()));
-        let store = f(builder).build();
-        Self {
+        // it does not conflict with the one attached here.
+        store.attach_sink(Arc::new(read_model.clone())).await?;
+        Ok(Self {
             store,
             driver,
             isle,
             read_model,
-        }
+        })
     }
 
     /// Borrow the underlying [`Store`] explicitly. Prefer using a

@@ -91,7 +91,9 @@ pub enum StoreError {
     /// materializes exactly that state) and any seq strictly after it. See
     /// [`crate::SNAPSHOT_KIND`] and the "Compaction and history boundary"
     /// section in `Store`'s module-level rustdoc.
-    #[error("seq below compaction boundary: stream compacted to {boundary:?}, requested={requested:?}")]
+    #[error(
+        "seq below compaction boundary: stream compacted to {boundary:?}, requested={requested:?}"
+    )]
     SeqCompacted {
         /// Earliest seq still materially reachable (the snapshot event's seq).
         boundary: Seq,
@@ -106,6 +108,19 @@ pub enum StoreError {
     /// Requested sink id is not registered on the store.
     #[error("unknown sink: {0}")]
     UnknownSink(String),
+
+    /// [`crate::Store::attach_sink`] was called with a
+    /// [`crate::ProjectionSink`] whose [`crate::ProjectionSink::id`]
+    /// matches one already registered (whether registered via
+    /// [`crate::StoreBuilder::sink`] at construction time or via an
+    /// earlier `attach_sink` call).
+    ///
+    /// Ids double as the checkpoint key, so two sinks sharing one id
+    /// would silently share — and corrupt — each other's checkpoint
+    /// bookkeeping. Reject the duplicate up front rather than let
+    /// dispatch quietly interleave two unrelated sinks' progress.
+    #[error("sink already attached: {0}")]
+    SinkAlreadyAttached(String),
 
     /// Optimistic-concurrency append rejected: the stream's head moved
     /// between the caller's expectation and the backend's atomic check.

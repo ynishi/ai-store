@@ -34,7 +34,7 @@ impl Store {
         at: Seq,
     ) -> Result<(), StoreError> {
         self.events.label_set(stream, label, at).await?;
-        if self.dispatcher.has_sinks() {
+        if self.dispatcher.has_sinks().await {
             let state = self.state_at(stream, at).await?;
             // `self.events` already applies the registered upcaster chain
             // (see `crate::upcasting_backend::UpcastingBackend`) when one is
@@ -85,7 +85,7 @@ impl Store {
     /// roll back the deletion.
     pub async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
         let existed = self.events.label_delete(stream, label).await?;
-        if existed && self.dispatcher.has_sinks() {
+        if existed && self.dispatcher.has_sinks().await {
             self.dispatcher.dispatch_label_deleted(stream, label).await;
         }
         Ok(existed)

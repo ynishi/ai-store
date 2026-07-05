@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use ai_store_core::{
-    GateCtx, ProjectionSink, SchemaGate, SchemaViolation, Seq, StoreError, StreamId,
+    Event, GateCtx, ProjectionSink, SchemaGate, SchemaViolation, Seq, StoreError, StreamId,
 };
 use ai_store_sqlite::{Query, SqliteStore};
 use serde_json::json;
@@ -189,4 +189,77 @@ async fn read_model_detached_stays_silent_and_uses_a_distinct_id() {
     assert_ne!(detached.id(), store.read_model().id());
 
     store.shutdown().await.unwrap();
+}
+
+// ---- read model now attaches via `Store::attach_sink` -------------------
+
+/// A no-op sink whose only purpose is to collide with the default read
+/// model's sink id.
+struct DummySink;
+
+#[async_trait::async_trait]
+impl ProjectionSink for DummySink {
+    fn id(&self) -> &str {
+        "read-model"
+    }
+    async fn commit(
+        &self,
+        _stream: &StreamId,
+        _seq: Seq,
+        _state: &serde_json::Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn open_with_sink_id_colliding_with_default_read_model_is_rejected() {
+    // The default read model is attached via `Store::attach_sink` (rather
+    // than pre-registered on the builder) after `f` runs — a caller-supplied
+    // sink using the same id ("read-model") now surfaces as a typed
+    // `SinkAlreadyAttached` error instead of silently coexisting as a second
+    // sink under one checkpoint key.
+    // `SqliteStore` does not implement `Debug`, so `.unwrap_err()` is not
+    // available — match explicitly instead.
+    let err =
+        match SqliteStore::open_in_memory_with(|builder| builder.sink(Arc::new(DummySink))).await {
+            Ok(_) => panic!("expected SinkAlreadyAttached, got Ok"),
+            Err(e) => e,
+        };
+    assert!(matches!(err, StoreError::SinkAlreadyAttached(id) if id == "read-model"));
+}
+
+#[tokio::test]
+async fn read_model_backfills_pre_existing_history_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store.db");
+    let s = StreamId::new("doc");
+
+    {
+        let store = SqliteStore::open(&path).await.unwrap();
+        store
+            .append(
+                &s,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": { "owner": "alice" } }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    // Re-opening builds a *fresh* `SqliteReadModel` instance and attaches it
+    // via `Store::attach_sink` again — the row already on disk is exactly
+    // what the backfill would (redundantly, harmlessly) reproduce, so this
+    // pins that the attach path does not regress the reopen story `open_
+    // persists_across_reopen_with_durable_checkpoints` already covers for
+    // the event log itself.
+    {
+        let store = SqliteStore::open(&path).await.unwrap();
+        let row = store.read_model().get(&s).await.unwrap().unwrap();
+        assert_eq!(row.state, json!({ "owner": "alice" }));
+        store.shutdown().await.unwrap();
+    }
 }

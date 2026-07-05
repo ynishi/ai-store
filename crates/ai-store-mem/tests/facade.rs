@@ -1752,12 +1752,7 @@ struct CountingCache {
 
 #[async_trait]
 impl ai_store_core::CacheBackend for CountingCache {
-    async fn put(
-        &self,
-        stream: &StreamId,
-        at: Seq,
-        state: &Value,
-    ) -> Result<(), StoreError> {
+    async fn put(&self, stream: &StreamId, at: Seq, state: &Value) -> Result<(), StoreError> {
         self.inner.put(stream, at, state).await
     }
     async fn nearest(
@@ -1768,11 +1763,7 @@ impl ai_store_core::CacheBackend for CountingCache {
         self.nearest_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.nearest(stream, at).await
     }
-    async fn prune(
-        &self,
-        stream: &StreamId,
-        keep_latest: usize,
-    ) -> Result<(), StoreError> {
+    async fn prune(&self, stream: &StreamId, keep_latest: usize) -> Result<(), StoreError> {
         self.inner.prune(stream, keep_latest).await
     }
 }
@@ -2018,10 +2009,7 @@ async fn upcaster_transforms_events_returned_from_store_read() {
     // Path in the returned patch has been rewritten.
     assert_eq!(op0["path"], json!("/newfield"));
     // Meta reflects the upgraded schema version.
-    assert_eq!(
-        events[0].meta.get(SCHEMA_VERSION_META_KEY),
-        Some(&json!(2))
-    );
+    assert_eq!(events[0].meta.get(SCHEMA_VERSION_META_KEY), Some(&json!(2)));
 }
 
 #[tokio::test]
@@ -2139,10 +2127,7 @@ async fn upcaster_chain_composes_v1_through_v3_in_registration_order() {
                     let raw: Value = serde_json::to_value(&op).unwrap();
                     let mut obj = raw.as_object().unwrap().clone();
                     if let Some(Value::String(p)) = obj.get("path") {
-                        obj.insert(
-                            "path".to_string(),
-                            Value::String(p.replace("/a", "/b")),
-                        );
+                        obj.insert("path".to_string(), Value::String(p.replace("/a", "/b")));
                     }
                     serde_json::from_value(Value::Object(obj)).unwrap()
                 })
@@ -2173,10 +2158,7 @@ async fn upcaster_chain_composes_v1_through_v3_in_registration_order() {
                     let raw: Value = serde_json::to_value(&op).unwrap();
                     let mut obj = raw.as_object().unwrap().clone();
                     if let Some(Value::String(p)) = obj.get("path") {
-                        obj.insert(
-                            "path".to_string(),
-                            Value::String(p.replace("/b", "/c")),
-                        );
+                        obj.insert("path".to_string(), Value::String(p.replace("/b", "/c")));
                     }
                     serde_json::from_value(Value::Object(obj)).unwrap()
                 })
@@ -2214,10 +2196,7 @@ async fn upcaster_chain_composes_v1_through_v3_in_registration_order() {
     let op0: Value = serde_json::to_value(&events[0].patch.0[0]).unwrap();
     // Path walked /a → /b → /c through the two upcasters.
     assert_eq!(op0["path"], json!("/c"));
-    assert_eq!(
-        events[0].meta.get(SCHEMA_VERSION_META_KEY),
-        Some(&json!(3))
-    );
+    assert_eq!(events[0].meta.get(SCHEMA_VERSION_META_KEY), Some(&json!(3)));
 }
 
 #[tokio::test]
@@ -2242,4 +2221,278 @@ async fn upcaster_absent_leaves_events_and_state_untouched() {
         .await
         .unwrap();
     assert_eq!(store.state(&s).await.unwrap(), json!({ "oldfield": 1 }));
+}
+
+// ---- attach_sink ----------------------------------------------------------
+
+#[tokio::test]
+async fn attach_sink_backfills_existing_history_then_receives_live_dispatch() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    // Build history before any sink exists.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let sink = Arc::new(RecordSink {
+        id: "attached".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    store.attach_sink(sink.clone()).await.unwrap();
+
+    // The pre-attach history was backfilled in the same call.
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1), ("doc".to_string(), 2)]
+    );
+
+    // Further appends dispatch live, same as a builder-time sink.
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 3 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.seen.lock().unwrap().clone(),
+        vec![
+            ("doc".to_string(), 1),
+            ("doc".to_string(), 2),
+            ("doc".to_string(), 3),
+        ]
+    );
+
+    // A follow-up catch_up is a no-op: attach_sink already caught it up.
+    let report = store.catch_up("attached").await.unwrap();
+    assert_eq!(report, CatchUpReport::EMPTY);
+}
+
+#[tokio::test]
+async fn attach_sink_rejects_duplicate_id_against_a_builder_time_sink() {
+    let existing = Arc::new(RecordSink {
+        id: "dup".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![existing.clone()],
+        StoreConfig::default(),
+    );
+
+    let newcomer = Arc::new(RecordSink {
+        id: "dup".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let err = store.attach_sink(newcomer).await.unwrap_err();
+    assert!(matches!(err, StoreError::SinkAlreadyAttached(id) if id == "dup"));
+}
+
+#[tokio::test]
+async fn attach_sink_rejects_duplicate_id_against_an_earlier_attach_sink_call() {
+    let store = store_no_gate_no_sink();
+    let first = Arc::new(RecordSink {
+        id: "dup".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    store.attach_sink(first).await.unwrap();
+
+    let second = Arc::new(RecordSink {
+        id: "dup".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let err = store.attach_sink(second).await.unwrap_err();
+    assert!(matches!(err, StoreError::SinkAlreadyAttached(id) if id == "dup"));
+}
+
+/// A `ProjectionSink` that declares `requires_rebuild_on_attach() -> true`,
+/// simulating a sink whose in-memory state cannot be trusted to survive a
+/// fresh instantiation (e.g. `ai_store_fileproj::CombinedFileSink`).
+struct RebuildRequiredSink {
+    id: String,
+    seen: StdMutex<Vec<(String, u64)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for RebuildRequiredSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        stream: &StreamId,
+        seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), seq.0));
+        Ok(())
+    }
+    fn requires_rebuild_on_attach(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn attach_sink_escalates_to_rebuild_when_required_after_a_restart() {
+    let events = Arc::new(MemEventBackend::new());
+    let cache = Arc::new(MemCacheBackend::new());
+    let checkpoint_backend: Arc<dyn CheckpointBackend> = Arc::new(MemCheckpointBackend::new());
+    let s = StreamId::new("doc");
+
+    // "First process": attach the rebuild-required sink, drive it through
+    // two events, and let its checkpoint persist to the shared backend.
+    let store1 = Store::with_checkpoint_backend(
+        events.clone(),
+        cache.clone(),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig::default(),
+        checkpoint_backend.clone(),
+    );
+    store1
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let sink1 = Arc::new(RebuildRequiredSink {
+        id: "combined".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    store1.attach_sink(sink1.clone()).await.unwrap();
+    store1
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "add", "path": "/x", "value": 1 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sink1.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1), ("doc".to_string(), 2)]
+    );
+    assert_eq!(
+        checkpoint_backend.get("combined", &s).await.unwrap(),
+        Some(Seq(2))
+    );
+
+    // "Second process": a fresh `Store` and a fresh sink *instance* sharing
+    // the same events + checkpoint backend. The persisted checkpoint says
+    // 2, but this instance's own in-memory `seen` is empty — without the
+    // `requires_rebuild_on_attach` escalation, attach_sink's backfill would
+    // resume from the persisted checkpoint and silently skip seq 1 and 2 in
+    // this fresh instance.
+    let store2 = Store::with_checkpoint_backend(
+        events,
+        cache,
+        Vec::new(),
+        Vec::new(),
+        StoreConfig::default(),
+        checkpoint_backend,
+    );
+    let sink2 = Arc::new(RebuildRequiredSink {
+        id: "combined".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    store2.attach_sink(sink2.clone()).await.unwrap();
+
+    assert_eq!(
+        sink2.seen.lock().unwrap().clone(),
+        vec![("doc".to_string(), 1), ("doc".to_string(), 2)]
+    );
+}
+
+#[tokio::test]
+async fn attach_sink_is_consistent_under_concurrent_append() {
+    let store = Arc::new(store_no_gate_no_sink());
+    let s = StreamId::new("doc");
+
+    // Some history before attach, so the backfill has work to do.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let sink = Arc::new(RecordSink {
+        id: "race".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+
+    const N: u64 = 20;
+    let attach_store = store.clone();
+    let attach_sink = sink.clone();
+    let attach_task = tokio::spawn(async move {
+        attach_store.attach_sink(attach_sink).await.unwrap();
+    });
+
+    let append_store = store.clone();
+    let append_stream = s.clone();
+    let append_task = tokio::spawn(async move {
+        for i in 0..N {
+            append_store
+                .append(
+                    &append_stream,
+                    "bump",
+                    patch(json!([{ "op": "add", "path": format!("/k{i}"), "value": i }])),
+                    json!({}),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    // Order deliberately left to the scheduler: whichever of attach/append
+    // runs first, the guarantee under test is what both eventually produce.
+    attach_task.await.unwrap();
+    append_task.await.unwrap();
+
+    // A final catch_up closes any gap left by whatever interleaving the
+    // scheduler picked (see `Store::attach_sink`'s rustdoc on the ordering
+    // guarantee), pinning down that every event is eventually observed
+    // regardless of the race.
+    store.catch_up("race").await.unwrap();
+
+    let seen_seqs: std::collections::BTreeSet<u64> = sink
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, seq)| *seq)
+        .collect();
+    let expected: std::collections::BTreeSet<u64> = (1..=(N + 1)).collect();
+    assert_eq!(seen_seqs, expected);
 }

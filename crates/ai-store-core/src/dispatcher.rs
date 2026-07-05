@@ -16,15 +16,20 @@
 //! already-upcasted `event` / `state` values from the caller rather than
 //! reading or upcasting anything themselves.
 //!
-//! This is also the intended attachment point for a future `attach_sink`
-//! API (dynamic sink registration after construction): any such method
-//! would add to `self.sinks` here rather than requiring a new `Store`.
+//! This is also the attachment point [`crate::Store::attach_sink`] uses for
+//! dynamic sink registration after construction: [`SinkDispatcher::attach`]
+//! pushes onto `self.sinks` here rather than requiring a new `Store`. The
+//! registry is an `RwLock` (rather than a plain `Vec` set once at
+//! construction) specifically so `attach` can run concurrently with the
+//! read-heavy `dispatch_commit` / `dispatch_label_set` /
+//! `dispatch_label_deleted` / `find_sink` traffic every other `Store` method
+//! generates.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::backend::CheckpointBackend;
 use crate::error::StoreError;
@@ -37,7 +42,12 @@ use crate::sink::{ProjectionSink, SinkDispatchFailure, SinkFailureObserver, Sink
 /// See the module-level rustdoc for the responsibility split between this
 /// type and `Store` itself.
 pub(crate) struct SinkDispatcher {
-    sinks: Vec<Arc<dyn ProjectionSink>>,
+    /// The sink registry. `RwLock` rather than a plain `Vec` so
+    /// [`SinkDispatcher::attach`] can add a sink after construction without
+    /// blocking (or being blocked by) concurrent dispatch — see
+    /// [`SinkDispatcher::attach`] for the duplicate-id contract and the
+    /// module-level rustdoc for why this exists at all.
+    sinks: RwLock<Vec<Arc<dyn ProjectionSink>>>,
     /// In-memory L1 cache of `(sink_id, stream) -> Seq`. See
     /// [`SinkDispatcher::checkpoint_get`] for the fallback to
     /// `checkpoint_backend` on a miss.
@@ -67,7 +77,7 @@ impl SinkDispatcher {
         sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
     ) -> Self {
         Self {
-            sinks,
+            sinks: RwLock::new(sinks),
             checkpoints: Mutex::new(HashMap::new()),
             checkpoint_backend,
             sink_failure_observer,
@@ -75,16 +85,44 @@ impl SinkDispatcher {
         }
     }
 
+    /// Register `sink` for dispatch going forward.
+    ///
+    /// Returns [`StoreError::SinkAlreadyAttached`] if a sink with the same
+    /// [`ProjectionSink::id`] is already registered — whether that sink was
+    /// registered at construction time (via [`crate::StoreBuilder::sink`])
+    /// or through an earlier `attach` call. Ids double as the checkpoint
+    /// key, so two live sinks sharing one id would silently share (and
+    /// corrupt) each other's checkpoint bookkeeping.
+    ///
+    /// The newly attached sink starts participating in
+    /// [`SinkDispatcher::dispatch_commit`] / `dispatch_label_set` /
+    /// `dispatch_label_deleted` the moment this call returns — see
+    /// [`crate::Store::attach_sink`] for how the caller backfills the
+    /// sink's pre-attach history without racing that live dispatch.
+    pub(crate) async fn attach(&self, sink: Arc<dyn ProjectionSink>) -> Result<(), StoreError> {
+        let mut sinks = self.sinks.write().await;
+        if sinks.iter().any(|s| s.id() == sink.id()) {
+            return Err(StoreError::SinkAlreadyAttached(sink.id().to_string()));
+        }
+        sinks.push(sink);
+        Ok(())
+    }
+
     /// Whether any sink is registered. Callers use this to skip fetching
     /// the committed event / materialized state entirely when there is
     /// nothing to dispatch to.
-    pub(crate) fn has_sinks(&self) -> bool {
-        !self.sinks.is_empty()
+    pub(crate) async fn has_sinks(&self) -> bool {
+        !self.sinks.read().await.is_empty()
     }
 
     /// Look up a registered sink by [`ProjectionSink::id`].
-    pub(crate) fn find_sink(&self, sink_id: &str) -> Option<Arc<dyn ProjectionSink>> {
-        self.sinks.iter().find(|s| s.id() == sink_id).cloned()
+    pub(crate) async fn find_sink(&self, sink_id: &str) -> Option<Arc<dyn ProjectionSink>> {
+        self.sinks
+            .read()
+            .await
+            .iter()
+            .find(|s| s.id() == sink_id)
+            .cloned()
     }
 
     /// Look up `sink_id`'s checkpoint for `stream`.
@@ -220,7 +258,12 @@ impl SinkDispatcher {
         next_state: &Value,
         event: &Event,
     ) {
-        for sink in &self.sinks {
+        // Snapshot the registry under a short-lived read lock rather than
+        // holding the guard across every sink's `commit` await below — a
+        // concurrent `attach` only has to wait for the (cheap) clone, not
+        // for however long dispatch to every sink takes.
+        let sinks = self.sinks.read().await.clone();
+        for sink in &sinks {
             if !sink.accepts(stream) {
                 continue;
             }
@@ -265,7 +308,8 @@ impl SinkDispatcher {
         state: &Value,
         event: &Event,
     ) {
-        for sink in &self.sinks {
+        let sinks = self.sinks.read().await.clone();
+        for sink in &sinks {
             if !sink.accepts(stream) {
                 continue;
             }
@@ -280,7 +324,8 @@ impl SinkDispatcher {
     /// [`ProjectionSink::on_label_deleted`]. Sink failures are best-effort,
     /// same as [`SinkDispatcher::dispatch_commit`] / `dispatch_label_set`.
     pub(crate) async fn dispatch_label_deleted(&self, stream: &StreamId, label: &Label) {
-        for sink in &self.sinks {
+        let sinks = self.sinks.read().await.clone();
+        for sink in &sinks {
             if !sink.accepts(stream) {
                 continue;
             }

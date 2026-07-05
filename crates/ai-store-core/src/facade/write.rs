@@ -275,7 +275,7 @@ impl Store {
 
         let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
         let has_upcasters = !self.upcasters.is_empty();
-        let has_sinks = self.dispatcher.has_sinks();
+        let has_sinks = self.dispatcher.has_sinks().await;
 
         // What "next state" to hand downstream (cache put + sink dispatch)
         // has to match what `state_at` would reconstruct at `seq` — so

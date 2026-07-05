@@ -341,8 +341,8 @@
 //! - [`read`] — `state` / `state_at` / `read` / `read_by_meta` / `head` /
 //!   `seq_at_time` / `streams` / `streams_live`.
 //! - [`labels`] — `label_set` / `label_resolve` / `labels` / `label_delete`.
-//! - [`lifecycle`] — `materialize_to_sink` / `catch_up` / `rebuild` /
-//!   `catch_up_inner`.
+//! - [`lifecycle`] — `attach_sink` / `materialize_to_sink` / `catch_up` /
+//!   `rebuild` / `catch_up_inner`.
 //!
 //! This file keeps the type definitions (`Store`, `StoreConfig`,
 //! `WriteMode`), the public constructors, and the private helper shared
