@@ -149,6 +149,109 @@ async fn revert_participates_in_the_log() {
     be.driver.shutdown().await.unwrap();
 }
 
+// ---- append-only DB-level trigger -----------------------------------------
+
+#[tokio::test]
+async fn raw_update_on_events_is_rejected_by_the_database_trigger() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Bypass the facade entirely and hit the production connection (the
+    // same `AsyncIsle` `Store::append` uses) directly, proving the trigger
+    // guards the real writer thread, not just a throwaway test connection.
+    let err = be
+        .isle()
+        .call(|conn| conn.execute("UPDATE events SET kind = 'tampered' WHERE seq = 1", []))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("append-only"));
+
+    // Untouched: the facade still sees the original event.
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 1 }));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_delete_on_events_is_rejected_by_the_database_trigger() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let err = be
+        .isle()
+        .call(|conn| conn.execute("DELETE FROM events WHERE seq = 1", []))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("append-only"));
+
+    assert_eq!(store.head(&s).await.unwrap(), Some(Seq(1)));
+
+    be.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn revert_still_works_with_the_append_only_trigger_active() {
+    let be = SqliteBackends::open_in_memory().await.unwrap();
+    let store = open_facade(&be).await;
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // `revert` is an INSERT (the reverse-diff event), never an UPDATE/DELETE
+    // on an existing row, so it must succeed even with both triggers active.
+    let reverted = store.revert(&s, Seq(1)).await.unwrap();
+    assert_eq!(reverted.seq, Seq(3));
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 1 }));
+
+    let count: i64 = be
+        .isle()
+        .call(|conn| conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)))
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+
+    be.driver.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn state_persists_across_reopen() {
     let dir = TempDir::new().unwrap();

@@ -73,6 +73,18 @@
 //! CREATE INDEX ix_read_model_updated ON read_model(updated_at);
 //! ```
 //!
+//! `ai_store_core`'s append-only invariant (no `delete`/`overwrite` on
+//! `EventBackend`) is an API-surface guarantee — it says nothing about a raw
+//! SQL client, a second process, or a manual `sqlite3` session touching the
+//! same file. Migration 4 backs the same invariant at the storage layer:
+//! `BEFORE UPDATE` / `BEFORE DELETE` triggers on `events` (`trg_events_no_update`
+//! / `trg_events_no_delete`) abort any mutation of an existing row, from any
+//! connection. `Store::revert` is unaffected — it appends the reverse-diff
+//! event rather than touching the row it's reverting, so it commutes with
+//! both triggers unchanged. `labels` / `cache` / `sink_checkpoints` /
+//! `read_model` are mutable by design (upserted, pruned, or advanced in
+//! place) and are deliberately left untriggered.
+//!
 //! WAL journal mode is enabled at open so multi-reader consumers can proceed
 //! concurrently with the writer.
 //!

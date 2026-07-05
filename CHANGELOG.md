@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai_store_sqlite`: `events` now carries a database-level append-only guard
+  (migration 4 — `trg_events_no_update` / `trg_events_no_delete`). Previously
+  the append-only invariant relied solely on `EventBackend` exposing no
+  `delete`/`overwrite` method; a raw SQL client, a second process opening the
+  same file, or a manual `sqlite3` session could still mutate `events`
+  directly. Any `UPDATE`/`DELETE` on `events` now aborts at the storage
+  layer regardless of the connection issuing it. `Store::revert` is
+  unaffected (it appends the reverse-diff event rather than mutating an
+  existing row). `labels` / `cache` / `sink_checkpoints` / `read_model` are
+  mutable by design and are not triggered.
 - `ai-store-core::Store::builder(events, cache) -> StoreBuilder`: incremental
   construction alternative to `Store::new` / `Store::with_checkpoint_backend`.
   `StoreBuilder` accumulates `.gate(..)` / `.sink(..)` one call at a time,

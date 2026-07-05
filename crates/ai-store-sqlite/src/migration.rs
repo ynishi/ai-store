@@ -84,6 +84,47 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         );
         CREATE INDEX IF NOT EXISTS ix_read_model_updated ON read_model(updated_at);
     "#,
+    // Migration 4 (index 3): database-level append-only enforcement on
+    // `events`.
+    //
+    // `ai_store_core`'s crate docs already state the invariant this backs:
+    // `EventBackend` exposes no `delete`/`overwrite` method, so no code path
+    // in this crate ever issues an `UPDATE`/`DELETE` against `events` (see
+    // `insert_event` in `crate::backend`, the sole writer). That is a
+    // guarantee about *this crate's* API surface, not about the database
+    // file itself — a raw SQL client, a second process opening the same
+    // file, or a manual `sqlite3` session could still mutate history. These
+    // two triggers close that gap at the storage layer: any `UPDATE` or
+    // `DELETE` on `events`, from any connection, aborts the statement before
+    // it runs.
+    //
+    // `ai_store_core::Store::revert` (and `revert_with_meta`) are unaffected
+    // — a revert is implemented as a new `INSERT` (the row for the
+    // reverse-diff event), never an `UPDATE`/`DELETE` of an existing row, so
+    // it commutes with both triggers unchanged.
+    //
+    // Scoped to `events` only. `labels` (upserted/deleted by `label_set` /
+    // `label_delete`), `cache` (pruned by `prune`), `sink_checkpoints`
+    // (advanced in place by checkpoint `put`), and `read_model` (upserted by
+    // `SqliteReadModel::commit`) are all mutable-by-design derived state —
+    // none of them carry the append-only invariant `events` does, so no
+    // trigger is added to them. Always on (not feature-gated): no call path
+    // in this crate ever needs to mutate `events`, so the trigger can never
+    // reject a legitimate operation. A future migration that needs to relax
+    // this (e.g. log compaction) would `DROP TRIGGER` in its own step.
+    r#"
+        CREATE TRIGGER IF NOT EXISTS trg_events_no_update
+        BEFORE UPDATE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'ai-store events are append-only (UPDATE denied)');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_events_no_delete
+        BEFORE DELETE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'ai-store events are append-only (DELETE denied)');
+        END;
+    "#,
 ];
 
 /// Apply every outstanding migration to `conn`, tracked via
@@ -214,6 +255,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn fresh_database_lands_the_events_immutability_triggers() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' \
+                 AND name IN ('trg_events_no_update', 'trg_events_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 2);
+    }
+
+    #[test]
+    fn update_on_events_is_rejected_by_the_trigger() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO events (stream, seq, kind, patch, meta, at_ms) \
+             VALUES ('doc', 1, 'init', '[]', '{}', 0)",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("UPDATE events SET kind = 'tampered' WHERE seq = 1", [])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("append-only"),
+            "expected an append-only rejection, got: {err}"
+        );
+
+        // The row is untouched — the trigger aborted before the write.
+        let kind: String = conn
+            .query_row("SELECT kind FROM events WHERE seq = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "init");
+    }
+
+    #[test]
+    fn delete_on_events_is_rejected_by_the_trigger() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO events (stream, seq, kind, patch, meta, at_ms) \
+             VALUES ('doc', 1, 'init', '[]', '{}', 0)",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("DELETE FROM events WHERE seq = 1", [])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("append-only"),
+            "expected an append-only rejection, got: {err}"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrating_an_existing_v3_database_lands_the_triggers() {
+        // Simulates a database written before migration 4 existed:
+        // migrations 1-3 already applied, `user_version = 3`.
+        let mut conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[0..3] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3i64).unwrap();
+        assert_eq!(user_version(&conn), 3);
+
+        apply(&mut conn).unwrap();
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute_batch(
+            "INSERT INTO events (stream, seq, kind, patch, meta, at_ms) \
+             VALUES ('doc', 1, 'init', '[]', '{}', 0)",
+        )
+        .unwrap();
+        let err = conn
+            .execute("DELETE FROM events WHERE seq = 1", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("append-only"));
     }
 
     #[test]
