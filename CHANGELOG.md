@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.9.0] - 2026-07-05
+
+### Added
+
 - `ai_store_sqlite`: `events` now carries a database-level append-only guard
   (migration 4 — `trg_events_no_update` / `trg_events_no_delete`). Previously
   the append-only invariant relied solely on `EventBackend` exposing no
@@ -120,14 +134,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai-store-core::StreamId` now derives `PartialOrd, Ord` (lexicographic over
   the inner `String`), needed for `CombinedFileSink`'s
   `BTreeMap<StreamId, _>` snapshot. Purely additive for existing consumers.
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
 
 ## [0.8.0] - 2026-07-05
 

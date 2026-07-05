@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "ai-store-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ai-store-mem",
  "async-trait",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-store-fileproj"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ai-store-core",
  "ai-store-mem",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-store-mem"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ai-store-core",
  "async-trait",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "ai-store-sqlite"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ai-store-core",
  "async-trait",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "ai-store-sync"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ai-store-core",
  "ai-store-mem",
