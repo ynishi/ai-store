@@ -50,7 +50,7 @@ impl Store {
     /// A commit dispatched live while the backfill is still in flight will
     /// not necessarily land contiguously with the sink's checkpoint (the
     /// checkpoint only advances when the dispatched `seq` immediately
-    /// follows it — see [`crate::dispatcher::SinkDispatcher::dispatch_commit`]
+    /// follows it — see `SinkDispatcher::dispatch_commit`
     /// — so a live dispatch that arrives ahead of the backfill's cursor
     /// leaves the checkpoint parked and the intervening gap for the
     /// backfill to fill in). The backfill below always runs to the head it

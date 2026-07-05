@@ -52,7 +52,7 @@ fn parse_ptr(path: &str) -> PointerBuf {
 ///
 /// # Panics
 ///
-/// See the "Panics" section of [`parse_ptr`] — `path` must be a
+/// See the "Panics" section of `parse_ptr` — `path` must be a
 /// syntactically valid JSON Pointer.
 pub fn add(path: &str, value: Value) -> Patch {
     Patch(vec![PatchOperation::Add(AddOperation {
@@ -65,7 +65,7 @@ pub fn add(path: &str, value: Value) -> Patch {
 ///
 /// # Panics
 ///
-/// See the "Panics" section of [`parse_ptr`] — `path` must be a
+/// See the "Panics" section of `parse_ptr` — `path` must be a
 /// syntactically valid JSON Pointer.
 pub fn replace(path: &str, value: Value) -> Patch {
     Patch(vec![PatchOperation::Replace(ReplaceOperation {
@@ -78,7 +78,7 @@ pub fn replace(path: &str, value: Value) -> Patch {
 ///
 /// # Panics
 ///
-/// See the "Panics" section of [`parse_ptr`] — `path` must be a
+/// See the "Panics" section of `parse_ptr` — `path` must be a
 /// syntactically valid JSON Pointer.
 pub fn remove(path: &str) -> Patch {
     Patch(vec![PatchOperation::Remove(RemoveOperation {
@@ -118,7 +118,7 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// See the "Panics" section of [`parse_ptr`] — `path` must be a
+    /// See the "Panics" section of `parse_ptr` — `path` must be a
     /// syntactically valid JSON Pointer.
     pub fn add(mut self, path: &str, value: Value) -> Self {
         self.ops.push(PatchOperation::Add(AddOperation {
@@ -132,7 +132,7 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// See the "Panics" section of [`parse_ptr`] — `path` must be a
+    /// See the "Panics" section of `parse_ptr` — `path` must be a
     /// syntactically valid JSON Pointer.
     pub fn replace(mut self, path: &str, value: Value) -> Self {
         self.ops.push(PatchOperation::Replace(ReplaceOperation {
@@ -146,7 +146,7 @@ impl Builder {
     ///
     /// # Panics
     ///
-    /// See the "Panics" section of [`parse_ptr`] — `path` must be a
+    /// See the "Panics" section of `parse_ptr` — `path` must be a
     /// syntactically valid JSON Pointer.
     pub fn remove(mut self, path: &str) -> Self {
         self.ops.push(PatchOperation::Remove(RemoveOperation {

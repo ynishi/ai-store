@@ -87,7 +87,7 @@ impl Store {
     /// the "Schema evolution" section in the module-level rustdoc). When no
     /// upcasters are registered, this is a straight pass-through of the
     /// backend's response. The chain application itself happens inside
-    /// `self.events` — see [`crate::upcasting_backend::UpcastingBackend`].
+    /// `self.events` — see `UpcastingBackend`.
     pub async fn read(
         &self,
         stream: &StreamId,
@@ -98,7 +98,7 @@ impl Store {
     }
 
     /// Enumerate events whose top-level `meta[field]` equals `value`. See
-    /// [`EventBackend::read_by_meta`].
+    /// [`crate::EventBackend::read_by_meta`].
     ///
     /// The `meta[field] == value` predicate is evaluated against the
     /// *stored* event (backends with a native `json_extract`-based

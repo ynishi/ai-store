@@ -32,9 +32,9 @@ impl Store {
     /// this for ordinary domain writes. See [`Store::import_event`] for the
     /// historical-timestamp counterpart used by import/migration paths.
     ///
-    /// Fast path: when no [`SchemaGate`] is registered, `next` is not
+    /// Fast path: when no [`crate::SchemaGate`] is registered, `next` is not
     /// materialized pre-commit. If the assigned `seq` misses the cache stride
-    /// and no [`ProjectionSink`] is registered, `next` is not materialized at
+    /// and no [`crate::ProjectionSink`] is registered, `next` is not materialized at
     /// all. See the crate-level cost-model section for the full breakdown.
     pub async fn append(
         &self,
@@ -75,8 +75,8 @@ impl Store {
     /// match `expected_head` (either at the pre-flight state read above or
     /// at the atomic backend check). Returns
     /// [`StoreError::BackendUnsupported`] when the underlying
-    /// [`EventBackend`] has not overridden
-    /// [`EventBackend::append_if_head`] (the default implementation
+    /// [`crate::EventBackend`] has not overridden
+    /// [`crate::EventBackend::append_if_head`] (the default implementation
     /// declines).
     ///
     /// Everything else — gate validation, cache write, sink dispatch — is
@@ -107,9 +107,9 @@ impl Store {
     /// Identical to [`Store::append`] in every other respect — the same
     /// gates validate the write, the same sinks are dispatched, the same
     /// cache-stride rule decides whether `next` is materialized. The only
-    /// difference is which [`EventBackend`] method is invoked: `append`
-    /// delegates to [`EventBackend::append`] (backend stamps "now"),
-    /// `import_event` delegates to [`EventBackend::import_event`] (backend
+    /// difference is which [`crate::EventBackend`] method is invoked: `append`
+    /// delegates to [`crate::EventBackend::append`] (backend stamps "now"),
+    /// `import_event` delegates to [`crate::EventBackend::import_event`] (backend
     /// stamps the supplied `at`). This is the escape hatch for backfilling
     /// history that already has its own notion of "when" — an import from a
     /// legacy system, for example — without discarding that timeline.
@@ -148,7 +148,7 @@ impl Store {
     /// and compare its `at` before importing.
     ///
     /// Returns [`StoreError::BackendUnsupported`] if the underlying
-    /// [`EventBackend`] has not overridden [`EventBackend::import_event`]
+    /// [`crate::EventBackend`] has not overridden [`crate::EventBackend::import_event`]
     /// (the default implementation declines).
     pub async fn import_event(
         &self,
@@ -169,13 +169,13 @@ impl Store {
     ///
     /// `mode` selects which backend method to invoke:
     ///
-    /// - [`WriteMode::Append`] → [`EventBackend::append`] (backend stamps
+    /// - [`WriteMode::Append`] → [`crate::EventBackend::append`] (backend stamps
     ///   "now"),
     /// - [`WriteMode::Import(at)`][WriteMode::Import] →
-    ///   [`EventBackend::import_event`] (backend stamps the supplied
+    ///   [`crate::EventBackend::import_event`] (backend stamps the supplied
     ///   timestamp),
     /// - [`WriteMode::AppendIfHead(expected_head)`][WriteMode::AppendIfHead]
-    ///   → [`EventBackend::append_if_head`] (backend runs the head check +
+    ///   → [`crate::EventBackend::append_if_head`] (backend runs the head check +
     ///   insert as one transaction; state materialization uses
     ///   `expected_head` as the caller's assumed current head, mapping
     ///   [`StoreError::SeqOutOfRange`] / [`StoreError::UnknownStream`] on
@@ -438,9 +438,9 @@ impl Store {
     ///
     /// The tombstone carries an empty patch — the materialized state does not
     /// change — but the event itself flows through the same write path as
-    /// [`Store::append`]: every registered [`SchemaGate`] validates it, the
+    /// [`Store::append`]: every registered [`crate::SchemaGate`] validates it, the
     /// per-stream write lock serializes it, and every accepting
-    /// [`ProjectionSink`] receives it. `meta` is opaque to the store (same
+    /// [`crate::ProjectionSink`] receives it. `meta` is opaque to the store (same
     /// contract as `append`); pass `Value::Null` (or `Value::Object(Map::new())`)
     /// when there is nothing to attribute.
     ///
@@ -472,7 +472,7 @@ impl Store {
     /// The append-only history on [`crate::EventBackend`] is untouched.
     ///
     /// Callers who want pruning to happen automatically after every
-    /// cache-stride write should set [`StoreConfig::cache_keep_latest`] at
+    /// cache-stride write should set [`crate::StoreConfig::cache_keep_latest`] at
     /// construction; those errors are silently ignored (the next write
     /// retries). This method is the explicit alternative: run it during
     /// maintenance windows, or when a long-running stream's cache has

@@ -15,7 +15,7 @@ impl Store {
     /// Pin `label` on `stream` to `at`.
     ///
     /// After the backend records the pin, every registered `ProjectionSink`
-    /// that [`ProjectionSink::accepts`] `stream` receives an `on_label_set`
+    /// that [`crate::ProjectionSink::accepts`] `stream` receives an `on_label_set`
     /// notification carrying the freshly materialized state at `at` and the
     /// [`crate::Event`] the label now points at. Sink failures are
     /// best-effort — they do not roll back the label change, matching the
@@ -72,12 +72,12 @@ impl Store {
     /// Idempotent: deleting a label that is not defined is **not** an error.
     /// Returns `Ok(true)` when the label existed and was removed, `Ok(false)`
     /// when it was already absent — mirroring the backend's
-    /// [`EventBackend::label_delete`] contract. Callers that need the strict
+    /// [`crate::EventBackend::label_delete`] contract. Callers that need the strict
     /// "must have existed" behavior can match on the returned `bool`
     /// themselves.
     ///
     /// After the backend removes the label, every registered
-    /// [`ProjectionSink`] that [`ProjectionSink::accepts`] `stream` receives
+    /// [`crate::ProjectionSink`] that [`crate::ProjectionSink::accepts`] `stream` receives
     /// an `on_label_deleted` notification — but only when the label actually
     /// existed (a no-op delete dispatches nothing, since nothing changed).
     /// Sink failures are best-effort — matching the dispatch policy of
