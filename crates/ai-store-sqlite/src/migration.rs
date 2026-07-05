@@ -66,6 +66,24 @@ pub(crate) const MIGRATIONS: &[&str] = &[
             PRIMARY KEY (sink_id, stream)
         );
     "#,
+    // Migration 3 (index 2): queryable read-model projection table.
+    //
+    // Backs `SqliteReadModel` (see `crate::read_model`), an opt-in
+    // `ProjectionSink` that materializes the latest state of every stream
+    // into one row each, queryable with `json_extract`-based filters instead
+    // of full event-log replay. `live` supports an optional tombstone
+    // convention (see `SqliteReadModel::with_tombstone_kind`); it defaults to
+    // 1 (live) for streams that never opt into tombstoning.
+    r#"
+        CREATE TABLE IF NOT EXISTS read_model (
+            stream     TEXT NOT NULL PRIMARY KEY,
+            state      TEXT NOT NULL,
+            last_seq   INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            live       INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS ix_read_model_updated ON read_model(updated_at);
+    "#,
 ];
 
 /// Apply every outstanding migration to `conn`, tracked via
@@ -172,6 +190,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fresh_database_lands_the_read_model_table_and_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn).unwrap();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'read_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ix_read_model_updated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
     }
 
     #[test]

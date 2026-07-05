@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ai-store-core::patch` module: `add`/`replace`/`remove` helpers and a
   chainable `Builder` for constructing single- or multi-operation
   `json_patch::Patch` values without hand-assembling JSON Patch documents.
+- `ai-store-sqlite::read_model::SqliteReadModel`: an opt-in `ProjectionSink`
+  that materializes the latest state of every stream into one queryable
+  `read_model` row (new migration 3 table), answering cross-stream questions
+  the event log itself has no index for (e.g. "which streams have
+  `meta.owner == \"alice\"`", "the 20 most recently updated streams") without
+  a dedicated dispatch path — it rides the existing `ProjectionSink` +
+  `catch_up` machinery. Query surface: `query` (dotted-field `Filter::{Eq,
+  In, Like, And, Or}` + `order_by` + `limit`/`offset`), `count`, `get`,
+  `tail`, and `create_field_index` for indexing a hot filter field. Field
+  paths are restricted to `[A-Za-z0-9_.]+` and always bound as query
+  parameters, never interpolated into SQL. The upsert is idempotent under
+  redelivery: a same- or older-`seq` `commit` for a stream never rewinds its
+  row (`WHERE excluded.last_seq > read_model.last_seq` on the conflict
+  branch). `with_tombstone_kind` opts a sink into a minimal live/dead toggle
+  (`Query::include_dead`) without any cascading delete semantics.
+  `SqliteBackends::isle` exposes the shared SQLite-thread handle needed to
+  construct one alongside the mandatory `events`/`cache`/`checkpoints` trio.
 
 ### Changed
 

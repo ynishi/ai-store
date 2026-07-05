@@ -107,4 +107,18 @@ impl SqliteBackends {
             driver: SqliteBackendDriver { inner: driver },
         }
     }
+
+    /// Borrow (clone) the `AsyncIsle` handle shared by every backend in this
+    /// bundle.
+    ///
+    /// Use this to build an *additional*, opt-in backend on the same SQLite
+    /// writer thread without spawning a second connection — e.g.
+    /// `SqliteReadModel::new(backends.isle())`. `read_model` is deliberately
+    /// not a field on `SqliteBackends` itself: unlike `events` / `cache` /
+    /// `checkpoints`, it is an optional `ProjectionSink` a consumer opts into
+    /// registering with `Store`, not a mandatory SPI backend every `Store`
+    /// needs.
+    pub fn isle(&self) -> AsyncIsle {
+        self.events.isle()
+    }
 }

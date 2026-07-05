@@ -27,6 +27,17 @@ impl SqliteEventBackend {
     pub fn new(isle: AsyncIsle) -> Self {
         Self { isle }
     }
+
+    /// Borrow (clone) the `AsyncIsle` handle this backend was built from.
+    ///
+    /// Exists so a caller can build an *additional* handle-based backend
+    /// (e.g. [`crate::read_model::SqliteReadModel`]) that shares the same
+    /// SQLite writer thread, without spawning a second `AsyncIsle`.
+    /// [`crate::SqliteBackends::isle`] is the usual entry point for this;
+    /// this inherent method is what it delegates to.
+    pub fn isle(&self) -> AsyncIsle {
+        self.isle.clone()
+    }
 }
 
 impl SqliteBackend for SqliteEventBackend {
@@ -81,7 +92,7 @@ impl SqliteBackend for SqliteCheckpointBackend {
     }
 }
 
-fn to_store_err<E: std::fmt::Display>(e: E) -> StoreError {
+pub(crate) fn to_store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
