@@ -103,6 +103,7 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
+use crate::builder::StoreBuilder;
 use crate::error::StoreError;
 use crate::event::{Committed, Event, NewEvent};
 use crate::gate::{GateCtx, SchemaGate};
@@ -152,11 +153,36 @@ pub struct Store {
 }
 
 impl Store {
+    /// Start an incremental [`StoreBuilder`] over the two mandatory
+    /// backends.
+    ///
+    /// Reduces the construction boilerplate of [`Store::new`] /
+    /// [`Store::with_checkpoint_backend`] at DI boundaries — a caller with no
+    /// gates and no sinks no longer writes out `Vec::new(), Vec::new()`, and
+    /// one that wants persisted checkpoints does not have to pick a
+    /// different constructor up front:
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use ai_store_core::Store;
+    /// # fn demo(events: Arc<dyn ai_store_core::EventBackend>, cache: Arc<dyn ai_store_core::CacheBackend>) {
+    /// let store = Store::builder(events, cache)
+    ///     .cache_stride(256)
+    ///     .build();
+    /// # let _ = store;
+    /// # }
+    /// ```
+    pub fn builder(events: Arc<dyn EventBackend>, cache: Arc<dyn CacheBackend>) -> StoreBuilder {
+        StoreBuilder::new(events, cache)
+    }
+
     /// Construct a store from a backend pair plus optional gates and sinks.
     ///
     /// Sink checkpoints live only in process memory — see the crate-level
     /// "Checkpoint storage note". Use [`Store::with_checkpoint_backend`] for
-    /// checkpoints that survive a restart.
+    /// checkpoints that survive a restart. [`Store::builder`] is the more
+    /// ergonomic entry point when only a subset of gates/sinks/checkpoints
+    /// is needed.
     pub fn new(
         events: Arc<dyn EventBackend>,
         cache: Arc<dyn CacheBackend>,

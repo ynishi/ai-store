@@ -76,6 +76,17 @@
 //! WAL journal mode is enabled at open so multi-reader consumers can proceed
 //! concurrently with the writer.
 //!
+//! ## Shortest path: `SqliteStore`
+//!
+//! Assembling `events`/`cache`/`checkpoints`/`driver` by hand from
+//! [`SqliteBackends`] is the fully-explicit path — the right level of
+//! control when a consumer needs a bespoke gate/sink wiring order, or wants
+//! to hold the driver and `Store` as independent fields. For the common
+//! case — "open a database, get a `Store` with durable checkpoints" —
+//! [`SqliteStore::open`] does that assembly in one call and derefs to
+//! [`ai_store_core::Store`], so most call sites never need to name
+//! `SqliteBackends` at all.
+//!
 //! ## Read-model projection (opt-in)
 //!
 //! `events` / `cache` / `checkpoints` are the mandatory SPI triad every
@@ -94,7 +105,9 @@ mod backend;
 mod driver;
 mod migration;
 pub mod read_model;
+mod store;
 
 pub use backend::{SqliteCacheBackend, SqliteCheckpointBackend, SqliteEventBackend};
 pub use driver::{SqliteBackendDriver, SqliteBackends};
 pub use read_model::{Filter, Order, Query, ReadModelRow, SqliteReadModel};
+pub use store::SqliteStore;

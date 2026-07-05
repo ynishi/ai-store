@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai-store-core::Store::builder(events, cache) -> StoreBuilder`: incremental
+  construction alternative to `Store::new` / `Store::with_checkpoint_backend`.
+  `StoreBuilder` accumulates `.gate(..)` / `.sink(..)` one call at a time,
+  `.checkpoints(..)` selects durable checkpoints, and `.config(..)` /
+  `.cache_stride(..)` set `StoreConfig` — `.build()` dispatches to whichever
+  underlying constructor `.checkpoints(..)` implies. Purely additive; `Store::new`
+  and `Store::with_checkpoint_backend` are unchanged and still the direct path
+  when every collaborator is known up front.
+- `ai_store_sqlite::SqliteStore`: one-shot SQLite-backed `Store` bundling the
+  backends, driver, and shared `AsyncIsle` handle that a hand-assembled
+  `SqliteBackends` + `Store::builder` + "keep the driver alive somewhere"
+  previously required a bespoke wrapper type for. `SqliteStore::open` /
+  `open_in_memory` build a `Store` with durable checkpoints and no gates/sinks
+  in one call; `open_with` / `open_in_memory_with` take an
+  `impl FnOnce(StoreBuilder) -> StoreBuilder` to register application-defined
+  gates/sinks before `build()`. Derefs to `Store`, so most call sites never
+  need to name `SqliteBackends` directly. `read_model()` builds a
+  `SqliteReadModel` sharing the same SQLite thread for direct queries (it does
+  not register itself as an automatic sink — see its rustdoc for why and for
+  the manual-assembly alternative when automatic dispatch from the first
+  write is needed). `shutdown()` joins the SQLite thread without a separate
+  driver handle.
+- `ai_store_core::KindGate`: a `SchemaGate` that dispatches validation by
+  event `kind` — `KindGate::new().on(kind, |ctx| ..).fallback(|ctx| ..)`
+  replaces the hand-written `match ctx.kind { .. }` a consumer with
+  per-kind validation rules (e.g. an `"append"` transition invariant vs. a
+  `"close"` required-fields invariant) previously had to write inside its own
+  `SchemaGate` impl. Unregistered kinds pass through unconditionally unless a
+  `.fallback` is set. `REVERT_KIND` is dispatched like any other kind — it is
+  not special-cased, so a validator or fallback that rejects it can make a
+  stream's history unrecoverable via `Store::revert`; see the rustdoc note on
+  `KindGate` for how to keep reverts usable.
 - `ai-store-core::ProjectionSink::accepts(&self, stream) -> bool`: default
   method (default `true`) letting a sink declare it is only interested in a
   subset of streams. The facade's automatic dispatch (post-`append` commit,

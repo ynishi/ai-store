@@ -25,21 +25,25 @@
 //!    transaction. There is no raw-append escape hatch on the public API.
 
 mod backend;
+mod builder;
 mod error;
 mod event;
 mod facade;
 mod gate;
 mod id;
+mod kind_gate;
 pub mod patch;
 mod sink;
 mod state;
 
 pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
+pub use builder::StoreBuilder;
 pub use error::{SchemaViolation, StoreError};
 pub use event::{Committed, Event, NewEvent};
 pub use facade::{Store, StoreConfig, REVERT_KIND};
 pub use gate::{GateCtx, SchemaGate};
 pub use id::{Label, Seq, StreamId, Timestamp};
+pub use kind_gate::KindGate;
 pub use sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
 pub use state::{empty_state, replay_from};
 

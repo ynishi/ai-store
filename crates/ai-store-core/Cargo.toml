@@ -19,3 +19,11 @@ uuid = { workspace = true }
 time = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# Dev-only cycle (ai-store-mem depends on ai-store-core normally): Cargo
+# permits dev-dependency cycles since they only participate in test/example
+# builds, never the library build itself. Used by the KindGate end-to-end
+# test to exercise the gate through a real `Store` without pulling in a
+# third crate.
+ai-store-mem = { path = "../ai-store-mem" }
