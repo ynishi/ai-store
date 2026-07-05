@@ -114,7 +114,11 @@ fn sanitize_component(raw: &str, kind: &str) -> Result<String, StoreError> {
     Ok(raw.to_string())
 }
 
-async fn write_atomic(path: &Path, body: &str) -> Result<(), StoreError> {
+/// Write `body` to `path` via a temp-sibling-then-rename, so a partial write
+/// is never observed by a concurrent reader. Shared with
+/// [`crate::CombinedFileSink`], which writes one composed file instead of
+/// one file per stream but needs the same crash-safety property.
+pub(crate) async fn write_atomic(path: &Path, body: &str) -> Result<(), StoreError> {
     // Write to a temp sibling then rename, so a partial write is never
     // observed by concurrent readers of the projection tree.
     let mut tmp = path.to_path_buf();
@@ -162,6 +166,7 @@ impl ProjectionSink for FileProjection {
         label: &Label,
         _at: Seq,
         state: &Value,
+        _event: &Event,
     ) -> Result<(), StoreError> {
         let label_slug = sanitize_component(label.as_str(), "label")?;
         let dir = self.stream_dir(stream)?;

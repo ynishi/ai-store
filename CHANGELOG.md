@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai-store-core::ProjectionSink::accepts(&self, stream) -> bool`: default
+  method (default `true`) letting a sink declare it is only interested in a
+  subset of streams. The facade's automatic dispatch (post-`append` commit,
+  `catch_up` / `rebuild`, `label_set` / `label_delete` notifications) skips a
+  stream a sink does not accept entirely — it is not counted in
+  `CatchUpReport::skipped`, since it was never that sink's concern.
+  `Store::materialize_to_sink` deliberately bypasses this filter (an explicit
+  caller-named dump). Replaces the previous pattern of a sink comparing
+  `stream` against a remembered value inside its own `commit` and no-op'ing
+  otherwise.
+- `ai_store_fileproj::CombinedFileSink` + `Renderer`: a `ProjectionSink` that
+  folds every stream it observes into one rendered file, keyed by an
+  in-memory `BTreeMap<StreamId, Value>` snapshot (dictionary order, since
+  `StreamId` now derives `Ord`). A repeat commit whose rendered output is
+  byte-identical to the last write is skipped rather than rewritten
+  (`DefaultHasher`-based duplicate-write filter, not an integrity check);
+  writes go through the same temp-sibling-then-rename as `FileProjection`.
+  The snapshot is process-memory only — after a restart, drive it via
+  `Store::rebuild` rather than trusting `catch_up` alone.
 - `ai-store-core::Store::revert_with_meta`: like `revert`, but merges
   caller-supplied fields into the appended revert event's `meta` instead of
   always writing the fixed `{"revert_to": to}` shape. `"revert_to"` is a
@@ -38,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `ProjectionSink::on_label_set` gains a fifth parameter,
+  `event: &Event` — the committed event the label now points at, so a sink
+  can read its `at` (wall-clock or imported timestamp) and `meta` without a
+  separate `read` round-trip or smuggling that information through
+  `Store::append`'s `meta` as a side channel. `Store::label_set` now fetches
+  that event (best-effort — a fetch failure or empty read is swallowed the
+  same way a failing `commit` is, since the label change itself already
+  succeeded). Every implementation in this workspace (`FileProjection`,
+  `ai-store-sync::SyncProjectionSink` + its `BlockingSink` bridge) is updated;
+  external implementations must add the parameter to keep compiling.
 - **BREAKING**: `EventBackend::append` / `EventBackend::import_event` now
   return `Result<Committed, StoreError>` instead of `Result<Seq, StoreError>`
   (new struct `Committed { seq, at }`). `Store::append`, `Store::import_event`,
@@ -46,6 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that previously round-tripped through `read(stream, seq, 1)` just to learn
   the backend-stamped `at` can now read it directly off the returned
   `Committed` value.
+- `ai-store-core::StreamId` now derives `PartialOrd, Ord` (lexicographic over
+  the inner `String`), needed for `CombinedFileSink`'s
+  `BTreeMap<StreamId, _>` snapshot. Purely additive for existing consumers.
 
 ### Deprecated
 

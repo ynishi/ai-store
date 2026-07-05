@@ -1418,6 +1418,292 @@ async fn concurrent_append_to_same_stream_serializes_gate_observations() {
     assert_eq!(final_state.as_object().unwrap().len(), N);
 }
 
+// ---- ProjectionSink::accepts --------------------------------------------
+
+/// A sink that only accepts one specific stream, recording every dispatch it
+/// actually received.
+struct SelectiveSink {
+    id: String,
+    accepted_stream: StreamId,
+    commits: StdMutex<Vec<(String, u64)>>,
+    label_sets: StdMutex<Vec<(String, String)>>,
+    label_deletes: StdMutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for SelectiveSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn accepts(&self, stream: &StreamId) -> bool {
+        stream == &self.accepted_stream
+    }
+    async fn commit(
+        &self,
+        stream: &StreamId,
+        seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        self.commits
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), seq.0));
+        Ok(())
+    }
+    async fn on_label_set(
+        &self,
+        stream: &StreamId,
+        label: &Label,
+        _at: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        self.label_sets
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), label.as_str().to_string()));
+        Ok(())
+    }
+    async fn on_label_deleted(&self, stream: &StreamId, label: &Label) -> Result<(), StoreError> {
+        self.label_deletes
+            .lock()
+            .unwrap()
+            .push((stream.as_str().to_string(), label.as_str().to_string()));
+        Ok(())
+    }
+}
+
+fn selective_sink(accepted: &StreamId) -> Arc<SelectiveSink> {
+    Arc::new(SelectiveSink {
+        id: "selective".to_string(),
+        accepted_stream: accepted.clone(),
+        commits: StdMutex::new(Vec::new()),
+        label_sets: StdMutex::new(Vec::new()),
+        label_deletes: StdMutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn accepts_filters_append_dispatch_and_catch_up_to_one_stream() {
+    let accepted = StreamId::new("accepted");
+    let other = StreamId::new("other");
+    let sink = selective_sink(&accepted);
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    store
+        .append(
+            &accepted,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &other,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Only the accepted stream's append was dispatched to the sink.
+    assert_eq!(
+        sink.commits.lock().unwrap().clone(),
+        vec![("accepted".to_string(), 1)]
+    );
+
+    // rebuild (reset + catch_up) never touches "other" at all: it is not
+    // applied, and it does not inflate `skipped`/`failed` either — the
+    // sink was never on the hook for that stream to begin with.
+    let report = store.rebuild("selective").await.unwrap();
+    assert_eq!(report.applied, 1);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        sink.commits.lock().unwrap().clone(),
+        vec![("accepted".to_string(), 1), ("accepted".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn accepts_filters_label_set_and_label_delete_notifications() {
+    let accepted = StreamId::new("accepted");
+    let other = StreamId::new("other");
+    let sink = selective_sink(&accepted);
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    for s in [&accepted, &other] {
+        store
+            .append(
+                s,
+                "init",
+                patch(json!([{ "op": "add", "path": "", "value": {} }])),
+                json!({}),
+            )
+            .await
+            .unwrap();
+    }
+    sink.commits.lock().unwrap().clear();
+
+    store
+        .label_set(&accepted, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+    store
+        .label_set(&other, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.label_sets.lock().unwrap().clone(),
+        vec![("accepted".to_string(), "v1".to_string())]
+    );
+
+    store
+        .label_delete(&accepted, &Label::new("v1"))
+        .await
+        .unwrap();
+    store.label_delete(&other, &Label::new("v1")).await.unwrap();
+    assert_eq!(
+        sink.label_deletes.lock().unwrap().clone(),
+        vec![("accepted".to_string(), "v1".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn materialize_to_sink_bypasses_the_accepts_filter() {
+    let accepted = StreamId::new("accepted");
+    let other = StreamId::new("other");
+    let sink = selective_sink(&accepted);
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+
+    store
+        .append(
+            &other,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    // The normal append dispatch above never reached the sink (it rejects
+    // "other"); clear defensively so the assertion below is unambiguous.
+    sink.commits.lock().unwrap().clear();
+
+    // An explicit `materialize_to_sink` call still succeeds and dispatches,
+    // even though `accepts("other")` is false — it is a caller-named,
+    // one-shot request, not automatic dispatch.
+    let dumped = store
+        .materialize_to_sink(&other, "selective", None)
+        .await
+        .unwrap();
+    assert_eq!(dumped, Seq(1));
+    assert_eq!(
+        sink.commits.lock().unwrap().clone(),
+        vec![("other".to_string(), 1)]
+    );
+}
+
+// ---- on_label_set carries the labeled event ------------------------------
+
+/// Records the `(at, event.at, event.meta)` triple observed by every
+/// `on_label_set` call.
+#[derive(Default)]
+struct LabelEventRecordSink {
+    id: String,
+    seen: StdMutex<Vec<(Seq, i64, Value)>>,
+}
+
+#[async_trait]
+impl ProjectionSink for LabelEventRecordSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn commit(
+        &self,
+        _stream: &StreamId,
+        _seq: Seq,
+        _state: &Value,
+        _event: &Event,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    async fn on_label_set(
+        &self,
+        _stream: &StreamId,
+        _label: &Label,
+        at: Seq,
+        _state: &Value,
+        event: &Event,
+    ) -> Result<(), StoreError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((at, event.at.0, event.meta.clone()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn label_set_notification_carries_the_labeled_events_timestamp_and_meta() {
+    let sink = Arc::new(LabelEventRecordSink {
+        id: "le".to_string(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        vec![sink.clone()],
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc");
+    let at = Timestamp(1_700_000_000_000);
+
+    store
+        .import_event(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({ "author": "alice" }),
+            at,
+        )
+        .await
+        .unwrap();
+
+    store
+        .label_set(&s, &Label::new("v1"), Seq(1))
+        .await
+        .unwrap();
+
+    let seen = sink.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, Seq(1));
+    assert_eq!(seen[0].1, at.0);
+    assert_eq!(seen[0].2, json!({ "author": "alice" }));
+}
+
 #[tokio::test]
 async fn read_by_meta_matches_json_null() {
     let store = store_no_gate_no_sink();

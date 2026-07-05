@@ -473,6 +473,9 @@ impl Store {
                 let events = self.events.read(stream, seq, 1).await?;
                 if let Some(ev) = events.into_iter().next() {
                     for sink in &self.sinks {
+                        if !sink.accepts(stream) {
+                            continue;
+                        }
                         let checkpoint = self.checkpoint_get(sink.id(), stream).await;
                         // Skip if already past this seq (catch_up ran concurrently).
                         if seq <= checkpoint {
@@ -652,9 +655,18 @@ impl Store {
     /// Pin `label` on `stream` to `at`.
     ///
     /// After the backend records the pin, every registered `ProjectionSink`
-    /// receives an `on_label_set` notification carrying the freshly
-    /// materialized state at `at`. Sink failures are best-effort — they do
-    /// not roll back the label change, matching the append dispatch policy.
+    /// that [`ProjectionSink::accepts`] `stream` receives an `on_label_set`
+    /// notification carrying the freshly materialized state at `at` and the
+    /// [`Event`] the label now points at. Sink failures are best-effort —
+    /// they do not roll back the label change, matching the append dispatch
+    /// policy.
+    ///
+    /// Fetching that event is itself best-effort: the label change has
+    /// already succeeded in the backend by this point, so a failure to read
+    /// the event back (or the read returning nothing, which should not
+    /// happen if `state_at` above just succeeded for the same `at`) is
+    /// swallowed the same way a failing `commit` is — it simply means no
+    /// sink is notified for this call, not that `label_set` itself fails.
     pub async fn label_set(
         &self,
         stream: &StreamId,
@@ -664,8 +676,19 @@ impl Store {
         self.events.label_set(stream, label, at).await?;
         if !self.sinks.is_empty() {
             let state = self.state_at(stream, at).await?;
-            for sink in &self.sinks {
-                let _ = sink.on_label_set(stream, label, at, &state).await;
+            let event = self
+                .events
+                .read(stream, at, 1)
+                .await
+                .ok()
+                .and_then(|mut evs| (!evs.is_empty()).then(|| evs.remove(0)));
+            if let Some(event) = event {
+                for sink in &self.sinks {
+                    if !sink.accepts(stream) {
+                        continue;
+                    }
+                    let _ = sink.on_label_set(stream, label, at, &state, &event).await;
+                }
             }
         }
         Ok(())
@@ -694,15 +717,19 @@ impl Store {
     /// themselves.
     ///
     /// After the backend removes the label, every registered
-    /// [`ProjectionSink`] receives an `on_label_deleted` notification — but
-    /// only when the label actually existed (a no-op delete dispatches
-    /// nothing, since nothing changed). Sink failures are best-effort —
-    /// matching the dispatch policy of [`Store::label_set`] and
-    /// [`Store::append`], a sink error does not roll back the deletion.
+    /// [`ProjectionSink`] that [`ProjectionSink::accepts`] `stream` receives
+    /// an `on_label_deleted` notification — but only when the label actually
+    /// existed (a no-op delete dispatches nothing, since nothing changed).
+    /// Sink failures are best-effort — matching the dispatch policy of
+    /// [`Store::label_set`] and [`Store::append`], a sink error does not
+    /// roll back the deletion.
     pub async fn label_delete(&self, stream: &StreamId, label: &Label) -> Result<bool, StoreError> {
         let existed = self.events.label_delete(stream, label).await?;
         if existed && !self.sinks.is_empty() {
             for sink in &self.sinks {
+                if !sink.accepts(stream) {
+                    continue;
+                }
                 let _ = sink.on_label_deleted(stream, label).await;
             }
         }
@@ -719,6 +746,13 @@ impl Store {
     /// [`Store::append`] and [`Store::label_set`], a failing `commit` here
     /// is propagated to the caller — an explicit dump is expected to
     /// succeed or report why it didn't.
+    ///
+    /// Unlike every automatic dispatch path (`append`, `catch_up` /
+    /// `rebuild`, `label_set`, `label_delete`), this call **bypasses**
+    /// [`ProjectionSink::accepts`] — the caller names `sink_id` and `stream`
+    /// explicitly, so the request is assumed to know what it is asking for
+    /// even if the sink would otherwise filter that stream out of its
+    /// automatic traffic.
     ///
     /// `at` lets a caller replay an arbitrary point in history to a sink,
     /// not just the head — useful for backfilling a newly attached sink
@@ -804,6 +838,13 @@ impl Store {
         let mut report = CatchUpReport::EMPTY;
 
         for stream in streams {
+            // A stream this sink does not accept is not this sink's concern
+            // at all: no checkpoint reset, no advance, and no contribution
+            // to `applied` / `skipped` / `failed` — counting it as
+            // "skipped" would imply it was owed a dispatch it never was.
+            if !sink.accepts(&stream) {
+                continue;
+            }
             if reset {
                 self.checkpoint_reset(sink_id, &stream).await;
             }

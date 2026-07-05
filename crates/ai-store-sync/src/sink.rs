@@ -58,6 +58,7 @@ pub trait SyncProjectionSink: Send + Sync + 'static {
         _label: &Label,
         _at: Seq,
         _state: &Value,
+        _event: &Event,
     ) -> Result<(), StoreError> {
         Ok(())
     }
@@ -154,17 +155,21 @@ impl<T: SyncProjectionSink> ProjectionSink for BlockingSink<T> {
         label: &Label,
         at: Seq,
         state: &Value,
+        event: &Event,
     ) -> Result<(), StoreError> {
         match self.dispatch {
-            Dispatch::Inline => self.inner.on_label_set(stream, label, at, state),
+            Dispatch::Inline => self.inner.on_label_set(stream, label, at, state, event),
             Dispatch::SpawnBlocking => {
                 let inner = Arc::clone(&self.inner);
                 let stream = stream.clone();
                 let label = label.clone();
                 let state = state.clone();
-                tokio::task::spawn_blocking(move || inner.on_label_set(&stream, &label, at, &state))
-                    .await
-                    .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
+                let event = event.clone();
+                tokio::task::spawn_blocking(move || {
+                    inner.on_label_set(&stream, &label, at, &state, &event)
+                })
+                .await
+                .map_err(|e| StoreError::Backend(format!("blocking sink join: {e}")))?
             }
         }
     }

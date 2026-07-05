@@ -14,7 +14,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Meaning is opaque to the store — typical values are a book slug, table name,
 /// or journal id. Uniqueness is scoped to a single `Store` instance.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord`/`PartialOrd` derive lexicographically over the inner `String` —
+/// this is what lets a multi-stream sink (e.g.
+/// `ai_store_fileproj::CombinedFileSink`) key a `BTreeMap<StreamId, _>` and
+/// get a stable, deterministic render order for free, without inventing its
+/// own comparator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamId(pub String);
 
 impl StreamId {

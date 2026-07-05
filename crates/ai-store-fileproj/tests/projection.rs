@@ -184,8 +184,15 @@ async fn label_names_with_null_byte_are_rejected() {
     let sink = FileProjection::with_json_pretty("fs", dir.path());
     let s = StreamId::new("ok");
     let bad = Label::new("v\0evil");
+    let event = ai_store_core::Event {
+        seq: Seq(1),
+        kind: "x".into(),
+        patch: serde_json::from_value(json!([])).unwrap(),
+        meta: json!({}),
+        at: ai_store_core::Timestamp(0),
+    };
     let err = sink
-        .on_label_set(&s, &bad, Seq(1), &json!({}))
+        .on_label_set(&s, &bad, Seq(1), &json!({}), &event)
         .await
         .unwrap_err();
     assert!(matches!(err, ai_store_core::StoreError::Backend(_)));

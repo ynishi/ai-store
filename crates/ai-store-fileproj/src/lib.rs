@@ -37,7 +37,18 @@
 //! - Path-safe: stream and label names containing path separators, null
 //!   bytes, or `..` are rejected with `StoreError::Backend`; they never
 //!   escape the projection root.
+//!
+//! ## `CombinedFileSink`
+//!
+//! [`FileProjection`] above is one-directory-per-stream. [`CombinedFileSink`]
+//! is the other shape: every stream it observes folds into one file at a
+//! fixed path, via a caller-supplied [`Renderer`] over a
+//! `BTreeMap<StreamId, Value>` snapshot (dictionary-ordered by stream, since
+//! `StreamId` derives `Ord` over its inner string). See its own rustdoc for
+//! the write-skipping and restart-cold-state details.
 
+mod combined;
 mod projection;
 
+pub use combined::{CombinedFileSink, Renderer};
 pub use projection::{FileProjection, RenderFn};

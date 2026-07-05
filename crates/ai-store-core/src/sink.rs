@@ -22,6 +22,32 @@ pub trait ProjectionSink: Send + Sync {
     /// Stable identifier used as the checkpoint key.
     fn id(&self) -> &str;
 
+    /// Whether this sink is interested in `stream`.
+    ///
+    /// Default: every sink accepts every stream. Override this when a sink
+    /// is scoped to a single stream (or a subset) and should be left alone
+    /// by every other stream's traffic — the alternative, prevalent before
+    /// this method existed, was for the sink's own `commit` /
+    /// `on_label_set` / `on_label_deleted` to compare `stream` against a
+    /// remembered value and no-op otherwise, duplicating this filter in
+    /// every implementation and in every one of the facade's automatic
+    /// dispatch sites.
+    ///
+    /// Honored by the facade's *automatic* dispatch: the post-`append`
+    /// `commit` call, `Store::catch_up` / `Store::rebuild` (a stream this
+    /// sink does not accept is skipped entirely — not counted in
+    /// [`CatchUpReport::skipped`], since it was never this sink's concern to
+    /// begin with), and the `on_label_set` / `on_label_deleted`
+    /// notifications from `Store::label_set` / `Store::label_delete`.
+    ///
+    /// **Not** honored by [`crate::Store::materialize_to_sink`]: that call
+    /// is an explicit, single-shot request naming both the stream and the
+    /// sink id, so a caller invoking it directly is assumed to know what it
+    /// is asking for.
+    fn accepts(&self, _stream: &StreamId) -> bool {
+        true
+    }
+
     /// Apply a single committed event.
     ///
     /// `state` is the materialized state at `seq` (i.e. after `event.patch` has
@@ -38,7 +64,12 @@ pub trait ProjectionSink: Send + Sync {
     /// React to a label being pinned or moved.
     ///
     /// Called from the facade after `Store::label_set` succeeds. `state` is
-    /// the materialized state at `at` (freshly reconstructed). The default
+    /// the materialized state at `at` (freshly reconstructed); `event` is
+    /// the committed [`Event`] the label now points at — most usefully its
+    /// `at` (wall-clock or imported timestamp) and `meta`, so a sink that
+    /// names its output after the labeled moment (e.g. a snapshot file keyed
+    /// by millis) does not have to smuggle that information through
+    /// `Store::append`'s `meta` argument as a side channel. The default
     /// implementation is a no-op; sinks that render label snapshots (e.g. a
     /// `<label>.md` file per label) override this. Implementations must be
     /// idempotent — the same `(stream, label, at)` may arrive more than once
@@ -49,6 +80,7 @@ pub trait ProjectionSink: Send + Sync {
         _label: &Label,
         _at: Seq,
         _state: &Value,
+        _event: &Event,
     ) -> Result<(), StoreError> {
         Ok(())
     }
