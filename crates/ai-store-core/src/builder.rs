@@ -16,6 +16,7 @@ use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
 use crate::facade::{Store, StoreConfig};
 use crate::gate::SchemaGate;
 use crate::sink::{ProjectionSink, SinkFailureObserver};
+use crate::upcaster::Upcaster;
 
 /// Builder for [`Store`]. Obtain one via [`Store::builder`].
 pub struct StoreBuilder {
@@ -25,6 +26,7 @@ pub struct StoreBuilder {
     sinks: Vec<Arc<dyn ProjectionSink>>,
     checkpoints: Option<Arc<dyn CheckpointBackend>>,
     sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
+    upcasters: Vec<Arc<dyn Upcaster>>,
     config: StoreConfig,
 }
 
@@ -41,6 +43,7 @@ impl StoreBuilder {
             sinks: Vec::new(),
             checkpoints: None,
             sink_failure_observer: None,
+            upcasters: Vec::new(),
             config: StoreConfig::default(),
         }
     }
@@ -106,11 +109,24 @@ impl StoreBuilder {
         self
     }
 
-    /// Build the `Store`. Dispatches to the private observer-aware
-    /// constructor with the optional [`SinkFailureObserver`] and
-    /// [`CheckpointBackend`] plumbing preserved.
+    /// Register an [`Upcaster`] applied at read time to every event
+    /// leaving the backend on this store. Upcasters accumulate in
+    /// registration order and compose as a pipeline — the intended shape
+    /// is one upcaster per schema-version transition, chained
+    /// `v1 → v2 → v3 → …`. See the "Schema evolution" section of the
+    /// facade module rustdoc for the recommended workflow, and
+    /// [`Upcaster`]'s module rustdoc for the contract and the
+    /// `read_by_meta` caveat.
+    pub fn upcaster(mut self, upcaster: Arc<dyn Upcaster>) -> Self {
+        self.upcasters.push(upcaster);
+        self
+    }
+
+    /// Build the `Store`. Dispatches to the private full-slot
+    /// constructor with every optional hook — [`SinkFailureObserver`],
+    /// [`CheckpointBackend`], upcaster chain — preserved.
     pub fn build(self) -> Store {
-        Store::new_inner_with_observer(
+        Store::new_inner_full(
             self.events,
             self.cache,
             self.gates,
@@ -118,6 +134,7 @@ impl StoreBuilder {
             self.config,
             self.checkpoints,
             self.sink_failure_observer,
+            self.upcasters,
         )
     }
 }

@@ -35,6 +35,7 @@ mod kind_gate;
 pub mod patch;
 mod sink;
 mod state;
+mod upcaster;
 
 pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
 pub use builder::StoreBuilder;
@@ -48,6 +49,7 @@ pub use sink::{
     CatchUpFailure, CatchUpReport, ProjectionSink, SinkDispatchFailure, SinkFailureObserver, SinkOp,
 };
 pub use state::{empty_state, replay_from};
+pub use upcaster::{Upcaster, SCHEMA_VERSION_META_KEY};
 
 // Re-export the patch type so consumers don't need a direct json-patch dep to
 // call `Store::append`.

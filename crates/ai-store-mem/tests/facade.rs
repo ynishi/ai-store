@@ -11,7 +11,7 @@ use std::sync::{
 use ai_store_core::{
     empty_state, CatchUpReport, CheckpointBackend, Event, EventBackend, GateCtx, Label, Patch,
     ProjectionSink, SchemaGate, SchemaViolation, Seq, Store, StoreConfig, StoreError, StreamId,
-    Timestamp,
+    Timestamp, Upcaster, SCHEMA_VERSION_META_KEY,
 };
 use ai_store_mem::{MemCacheBackend, MemCheckpointBackend, MemEventBackend};
 use async_trait::async_trait;
@@ -1893,4 +1893,353 @@ async fn catch_up_bootstraps_state_at_most_once_per_stream() {
         assert_eq!(*seq, expected_seq);
         assert_eq!(state, &json!({ "n": (i + 1) as u64 }));
     }
+}
+
+// ---- issue #16: read-time event upcasting ------------------------------
+
+/// Rewrites v1-shape patches (paths under `/oldfield`) to v2-shape
+/// (paths under `/newfield`) on the way out. Any event with
+/// `meta._schema_version == 1` is upgraded to v2; events already at v2
+/// pass through unchanged. Used across the tests below to cover the
+/// state / state_at / read / sink dispatch paths.
+struct FieldRenameV1toV2;
+
+impl Upcaster for FieldRenameV1toV2 {
+    fn upcast(&self, mut event: Event) -> Event {
+        // Dispatch on the reserved schema-version meta key. Events at v2
+        // (or missing the key entirely and structurally new-shape) pass
+        // through unchanged.
+        let version = event
+            .meta
+            .get(SCHEMA_VERSION_META_KEY)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2);
+        if version != 1 {
+            return event;
+        }
+        // Rewrite `/oldfield` → `/newfield` in every patch op path.
+        let patches = event.patch.0.clone();
+        let rewritten: Vec<_> = patches
+            .into_iter()
+            .map(|op| {
+                let raw: Value = serde_json::to_value(&op).unwrap();
+                let mut obj = raw.as_object().unwrap().clone();
+                if let Some(Value::String(p)) = obj.get("path") {
+                    let new_p = p.replace("/oldfield", "/newfield");
+                    obj.insert("path".to_string(), Value::String(new_p));
+                }
+                serde_json::from_value(Value::Object(obj)).unwrap()
+            })
+            .collect();
+        event.patch = json_patch::Patch(rewritten);
+        // Stamp the upgraded version so downstream sees the same shape
+        // metadata even for a resurrected v1 payload.
+        if let Some(map) = event.meta.as_object_mut() {
+            map.insert(SCHEMA_VERSION_META_KEY.to_string(), json!(2));
+        }
+        event
+    }
+}
+
+fn store_with_upcaster<U: Upcaster + 'static>(uc: U) -> Store {
+    Store::builder(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+    )
+    .upcaster(Arc::new(uc))
+    .build()
+}
+
+#[tokio::test]
+async fn upcaster_rewrites_v1_patches_before_state_replay() {
+    let store = store_with_upcaster(FieldRenameV1toV2);
+    let s = StreamId::new("doc");
+
+    // Write two v1-shape events. On disk they still target `/oldfield`,
+    // but read-time upcasting maps them to `/newfield`. Seed with an
+    // empty root object first so subsequent `add` ops have a container
+    // to add into.
+    store
+        .append(
+            &s,
+            "seed",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            // Seed is version-agnostic — leave the schema key off so
+            // the upcaster's default (v2 pass-through) applies.
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "/oldfield", "value": 1 }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/oldfield", "value": 2 }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+
+    // The reconstructed state uses the new field name.
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "newfield": 2 }));
+    // state_at at an intermediate seq also honors the upcaster.
+    assert_eq!(
+        store.state_at(&s, Seq(2)).await.unwrap(),
+        json!({ "newfield": 1 })
+    );
+}
+
+#[tokio::test]
+async fn upcaster_transforms_events_returned_from_store_read() {
+    let store = store_with_upcaster(FieldRenameV1toV2);
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "/oldfield", "value": 1 }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+
+    let events = store.read(&s, Seq(1), 10).await.unwrap();
+    let op0: Value = serde_json::to_value(&events[0].patch.0[0]).unwrap();
+    // Path in the returned patch has been rewritten.
+    assert_eq!(op0["path"], json!("/newfield"));
+    // Meta reflects the upgraded schema version.
+    assert_eq!(
+        events[0].meta.get(SCHEMA_VERSION_META_KEY),
+        Some(&json!(2))
+    );
+}
+
+#[tokio::test]
+async fn upcaster_passes_v2_events_through_unchanged() {
+    let store = store_with_upcaster(FieldRenameV1toV2);
+    let s = StreamId::new("doc");
+
+    // Write a v2-shape event that already targets `/newfield`. The
+    // upcaster's dispatch sees version=2 and leaves it alone.
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "newfield": 9 } }])),
+            json!({ SCHEMA_VERSION_META_KEY: 2 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "newfield": 9 }));
+    let events = store.read(&s, Seq(1), 1).await.unwrap();
+    let op0: Value = serde_json::to_value(&events[0].patch.0[0]).unwrap();
+    assert_eq!(op0["path"], json!(""));
+}
+
+#[tokio::test]
+async fn upcaster_is_applied_to_sink_dispatch_state_and_event() {
+    #[derive(Default)]
+    struct RecordingSink {
+        commits: StdMutex<Vec<(Seq, Value, Value)>>,
+    }
+
+    #[async_trait]
+    impl ProjectionSink for RecordingSink {
+        fn id(&self) -> &str {
+            "record"
+        }
+        async fn commit(
+            &self,
+            _stream: &StreamId,
+            seq: Seq,
+            state: &Value,
+            event: &Event,
+        ) -> Result<(), StoreError> {
+            // Store both the reconstructed state and the raw patch op
+            // paths — we want to prove both were upcasted.
+            let path_dump = serde_json::to_value(&event.patch.0).unwrap();
+            self.commits
+                .lock()
+                .unwrap()
+                .push((seq, state.clone(), path_dump));
+            Ok(())
+        }
+    }
+
+    let sink = Arc::new(RecordingSink::default());
+    let store = Store::builder(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+    )
+    .upcaster(Arc::new(FieldRenameV1toV2))
+    .sink(sink.clone())
+    .build();
+    let s = StreamId::new("doc");
+
+    // Seed with an empty root, then add the tagged v1 event.
+    store
+        .append(
+            &s,
+            "seed",
+            patch(json!([{ "op": "add", "path": "", "value": {} }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "/oldfield", "value": 7 }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+
+    let commits = sink.commits.lock().unwrap().clone();
+    // The seed and the tagged event each produce one commit callback.
+    assert_eq!(commits.len(), 2);
+    let (seq, state, patch_dump) = &commits[1];
+    assert_eq!(*seq, Seq(2));
+    // Sink saw the upcasted state, not the raw {"oldfield": 7}.
+    assert_eq!(state, &json!({ "newfield": 7 }));
+    // And the event's patch op path was rewritten too.
+    let ops: Vec<Value> = patch_dump.as_array().unwrap().clone();
+    assert_eq!(ops[0]["path"], json!("/newfield"));
+    assert_eq!(ops[0]["value"], json!(7));
+}
+
+#[tokio::test]
+async fn upcaster_chain_composes_v1_through_v3_in_registration_order() {
+    struct V1toV2;
+    impl Upcaster for V1toV2 {
+        fn upcast(&self, mut event: Event) -> Event {
+            let version = event
+                .meta
+                .get(SCHEMA_VERSION_META_KEY)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2);
+            if version != 1 {
+                return event;
+            }
+            let ops = event.patch.0.clone();
+            let rewritten: Vec<_> = ops
+                .into_iter()
+                .map(|op| {
+                    let raw: Value = serde_json::to_value(&op).unwrap();
+                    let mut obj = raw.as_object().unwrap().clone();
+                    if let Some(Value::String(p)) = obj.get("path") {
+                        obj.insert(
+                            "path".to_string(),
+                            Value::String(p.replace("/a", "/b")),
+                        );
+                    }
+                    serde_json::from_value(Value::Object(obj)).unwrap()
+                })
+                .collect();
+            event.patch = json_patch::Patch(rewritten);
+            if let Some(map) = event.meta.as_object_mut() {
+                map.insert(SCHEMA_VERSION_META_KEY.to_string(), json!(2));
+            }
+            event
+        }
+    }
+
+    struct V2toV3;
+    impl Upcaster for V2toV3 {
+        fn upcast(&self, mut event: Event) -> Event {
+            let version = event
+                .meta
+                .get(SCHEMA_VERSION_META_KEY)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3);
+            if version != 2 {
+                return event;
+            }
+            let ops = event.patch.0.clone();
+            let rewritten: Vec<_> = ops
+                .into_iter()
+                .map(|op| {
+                    let raw: Value = serde_json::to_value(&op).unwrap();
+                    let mut obj = raw.as_object().unwrap().clone();
+                    if let Some(Value::String(p)) = obj.get("path") {
+                        obj.insert(
+                            "path".to_string(),
+                            Value::String(p.replace("/b", "/c")),
+                        );
+                    }
+                    serde_json::from_value(Value::Object(obj)).unwrap()
+                })
+                .collect();
+            event.patch = json_patch::Patch(rewritten);
+            if let Some(map) = event.meta.as_object_mut() {
+                map.insert(SCHEMA_VERSION_META_KEY.to_string(), json!(3));
+            }
+            event
+        }
+    }
+
+    // Register in the order v1→v2, v2→v3. A v1-tagged write must walk
+    // both and land as v3-shape.
+    let store = Store::builder(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+    )
+    .upcaster(Arc::new(V1toV2))
+    .upcaster(Arc::new(V2toV3))
+    .build();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "/a", "value": 42 }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+
+    let events = store.read(&s, Seq(1), 1).await.unwrap();
+    let op0: Value = serde_json::to_value(&events[0].patch.0[0]).unwrap();
+    // Path walked /a → /b → /c through the two upcasters.
+    assert_eq!(op0["path"], json!("/c"));
+    assert_eq!(
+        events[0].meta.get(SCHEMA_VERSION_META_KEY),
+        Some(&json!(3))
+    );
+}
+
+#[tokio::test]
+async fn upcaster_absent_leaves_events_and_state_untouched() {
+    // Sanity: with no upcaster registered, the store is a pass-through.
+    let store = Store::new(
+        Arc::new(MemEventBackend::new()),
+        Arc::new(MemCacheBackend::new()),
+        Vec::new(),
+        Vec::new(),
+        StoreConfig::default(),
+    );
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "oldfield": 1 } }])),
+            json!({ SCHEMA_VERSION_META_KEY: 1 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.state(&s).await.unwrap(), json!({ "oldfield": 1 }));
 }

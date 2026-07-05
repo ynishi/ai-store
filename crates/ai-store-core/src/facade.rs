@@ -272,6 +272,63 @@
 //!
 //! Neither option risks history: [`Store::state_at`] reconstructs any lost
 //! snapshot by replaying forward from a still-cached nearest neighbor.
+//!
+//! ## Schema evolution
+//!
+//! Long-lived streams outlast the JSON shape their patches were originally
+//! written against. Without a translation hook, [`Store::state_at`] would
+//! reconstruct a mixed old/new document (the old patches target old paths,
+//! newer patches target new paths, and the two layers coexist on the same
+//! `Value` tree) — and gates, sinks, and read-model field extraction would
+//! see that mixed shape. The append-only enforcement on the backend (see
+//! `ai-store-sqlite`'s migration 4) makes in-place event rewriting
+//! impossible; the only sanctioned answer is a read-time projection.
+//!
+//! [`crate::Upcaster`] is that projection. It is a consumer-supplied
+//! function `Event -> Event` registered on the [`StoreBuilder`], applied
+//! by every read path in this facade — public [`Store::read`] /
+//! [`Store::read_by_meta`], the internal reads inside [`Store::state_at`]
+//! / [`Store::catch_up`] / [`Store::materialize_to_sink`], and the
+//! post-`append` / post-`label_set` sink dispatch. The stored bytes on
+//! the backend are untouched; the log stays byte-identical and the
+//! append-only invariant is preserved.
+//!
+//! ### Chain semantics
+//!
+//! Multiple upcasters compose in registration order — one upcaster per
+//! schema-version transition (`v1 → v2`, `v2 → v3`, …), each dispatching
+//! internally on `event.meta[SCHEMA_VERSION_META_KEY]`. A `v1` event
+//! walks the entire chain and arrives at `v3`; a `v3` event flows through
+//! each step unchanged when the dispatch decides not to touch it. The
+//! chain is walked once per event per read; there is no per-store cache.
+//!
+//! ### `read_by_meta` caveat
+//!
+//! [`Store::read_by_meta`] evaluates its `meta[field] == value` predicate
+//! against the *stored* event, not the upcasted one — backends with a
+//! native `json_extract`-based implementation filter inside the backend
+//! before any upcaster sees the row. Consumers that mix schema evolution
+//! with `read_by_meta` should keep the meta fields they filter on stable
+//! across shape changes (add a compatible synonym first, then rename
+//! after all readers understand the new key). Every other read path is
+//! covered by the chain.
+//!
+//! ### Recommended workflow
+//!
+//! 1. Prefer additive changes — a new field with a default value in the
+//!    reducer, or a new event kind that older readers ignore — over
+//!    shape rewrites. Additive changes never need an upcaster.
+//! 2. When a shape rewrite is unavoidable, ship the upcaster for the
+//!    old-to-new transition *before* the first write of the new shape,
+//!    and stamp new writes with the target
+//!    [`crate::SCHEMA_VERSION_META_KEY`] value. Old readers still see
+//!    what they expect (they don't have the upcaster); new readers
+//!    upgrade old-shape events to the current shape on the fly.
+//! 3. When an old shape is truly obsolete and the consumer no longer
+//!    ships the upcaster for it, retire it permanently by compacting
+//!    (see the "Compaction and history boundary" section) — the
+//!    snapshot event captures the current-shape state and drops the
+//!    old-shape prefix from the log entirely.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -289,6 +346,7 @@ use crate::id::{Label, Seq, StreamId, Timestamp};
 use crate::sink::{
     CatchUpFailure, CatchUpReport, ProjectionSink, SinkDispatchFailure, SinkFailureObserver, SinkOp,
 };
+use crate::upcaster::Upcaster;
 use crate::state::{empty_state, replay_from};
 
 /// Kind used for the internal event a `revert` writes to the log.
@@ -408,6 +466,10 @@ pub struct Store {
     /// normally. Cleared on process restart by construction (in-memory
     /// only, never persisted).
     rebuilt_this_process: Arc<StdMutex<HashSet<String>>>,
+    /// Read-time event upcasters — see [`crate::Upcaster`]. Each read
+    /// path in this facade walks the chain in registration order before
+    /// handing events off to replay, sinks, or the caller.
+    upcasters: Vec<Arc<dyn Upcaster>>,
     config: StoreConfig,
 }
 
@@ -502,6 +564,32 @@ impl Store {
         checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
         sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
     ) -> Self {
+        Self::new_inner_full(
+            events,
+            cache,
+            gates,
+            sinks,
+            config,
+            checkpoint_backend,
+            sink_failure_observer,
+            Vec::new(),
+        )
+    }
+
+    /// Inner constructor that accepts every optional slot, including the
+    /// upcaster chain. Kept crate-private; the builder is the one exposed
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_inner_full(
+        events: Arc<dyn EventBackend>,
+        cache: Arc<dyn CacheBackend>,
+        gates: Vec<Arc<dyn SchemaGate>>,
+        sinks: Vec<Arc<dyn ProjectionSink>>,
+        config: StoreConfig,
+        checkpoint_backend: Option<Arc<dyn CheckpointBackend>>,
+        sink_failure_observer: Option<Arc<dyn SinkFailureObserver>>,
+        upcasters: Vec<Arc<dyn Upcaster>>,
+    ) -> Self {
         Self {
             events,
             cache,
@@ -512,8 +600,28 @@ impl Store {
             stream_locks: Arc::new(StdMutex::new(HashMap::new())),
             sink_failure_observer,
             rebuilt_this_process: Arc::new(StdMutex::new(HashSet::new())),
+            upcasters,
             config,
         }
+    }
+
+    /// Apply the registered upcaster chain to `event`, in registration
+    /// order. Returns the transformed event; passes through unchanged
+    /// when no upcasters are registered.
+    fn apply_upcasters(&self, mut event: Event) -> Event {
+        for uc in &self.upcasters {
+            event = uc.upcast(event);
+        }
+        event
+    }
+
+    /// Apply the upcaster chain to every event in `events`. Used by every
+    /// internal read path.
+    fn apply_upcasters_all(&self, events: Vec<Event>) -> Vec<Event> {
+        if self.upcasters.is_empty() {
+            return events;
+        }
+        events.into_iter().map(|e| self.apply_upcasters(e)).collect()
     }
 
     /// Notify the observer if one is attached; no-op otherwise. Kept small
@@ -861,21 +969,51 @@ impl Store {
         let seq = committed.seq;
 
         let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
-        let needs_next = cache_hit || !self.sinks.is_empty();
+        let has_upcasters = !self.upcasters.is_empty();
+        let has_sinks = !self.sinks.is_empty();
 
-        // Materialize `next` only if a downstream path actually reads it.
-        let next: Option<Value> = if let Some(n) = precomputed_next {
-            Some(n)
-        } else if needs_next {
-            let mut n = current.clone();
-            json_patch::patch(&mut n, patch_for_reapply.as_ref().unwrap())
-                .map_err(|e| StoreError::Patch(format!("post-commit reapply: {e}")))?;
-            Some(n)
+        // What "next state" to hand downstream (cache put + sink dispatch)
+        // has to match what `state_at` would reconstruct at `seq` — so
+        // when upcasters are registered, materialize `next` from the
+        // *upcasted* patch, not the raw one the backend stored. The raw
+        // fast path is preserved when no upcasters are in play, to keep
+        // the pre-upcaster performance profile intact.
+        let downstream: Option<(Value, Option<Event>)> = if cache_hit || has_sinks {
+            if has_upcasters {
+                // Read the committed event, upcast it, then apply the
+                // upcasted patch to `current` (which is already the
+                // upcasted-shape state, since `self.state` runs through
+                // upcasters too). Fetch the event once and reuse it for
+                // the sink dispatch below.
+                let raw = self.events.read(stream, seq, 1).await?;
+                let ev = self
+                    .apply_upcasters_all(raw)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        StoreError::Backend(format!(
+                            "post-commit read at seq={} returned nothing",
+                            seq.0
+                        ))
+                    })?;
+                let mut next = current.clone();
+                json_patch::patch(&mut next, &ev.patch).map_err(|e| {
+                    StoreError::Patch(format!("post-commit upcasted reapply: {e}"))
+                })?;
+                Some((next, Some(ev)))
+            } else if let Some(precomputed) = precomputed_next {
+                Some((precomputed, None))
+            } else {
+                let mut n = current.clone();
+                json_patch::patch(&mut n, patch_for_reapply.as_ref().unwrap())
+                    .map_err(|e| StoreError::Patch(format!("post-commit reapply: {e}")))?;
+                Some((n, None))
+            }
         } else {
             None
         };
 
-        if let Some(ref next_state) = next {
+        if let Some((ref next_state, ref preloaded_event)) = downstream {
             if cache_hit {
                 self.cache.put(stream, seq, next_state).await?;
                 // Opportunistic bounded pruning when the caller opted in via
@@ -890,8 +1028,15 @@ impl Store {
             }
 
             // Post-commit sink dispatch (best-effort; failure leaves checkpoint alone).
-            if !self.sinks.is_empty() {
-                let events = self.events.read(stream, seq, 1).await?;
+            if has_sinks {
+                // Reuse the event we already fetched (and upcasted) if the
+                // upcaster path took it; otherwise fetch here.
+                let events: Vec<Event> = if let Some(ev) = preloaded_event.clone() {
+                    vec![ev]
+                } else {
+                    let raw = self.events.read(stream, seq, 1).await?;
+                    self.apply_upcasters_all(raw)
+                };
                 if let Some(ev) = events.into_iter().next() {
                     for sink in &self.sinks {
                         if !sink.accepts(stream) {
@@ -987,6 +1132,7 @@ impl Store {
         }
         let limit = (at.0 - from.0 + 1) as usize;
         let events = self.events.read(stream, from, limit).await?;
+        let events = self.apply_upcasters_all(events);
         // Compaction leaves gaps in the seq sequence — the reader may
         // legitimately return fewer than `limit` events, or events with
         // seqs beyond `at` when the earliest event on the stream is a
@@ -1097,17 +1243,34 @@ impl Store {
     }
 
     /// Enumerate events. See `EventBackend::read`.
+    ///
+    /// Every returned [`Event`] is passed through the registered
+    /// [`Upcaster`] chain before it is handed back to the caller (see the
+    /// "Schema evolution" section in the module-level rustdoc). When no
+    /// upcasters are registered, this is a straight pass-through of the
+    /// backend's response.
     pub async fn read(
         &self,
         stream: &StreamId,
         from: Seq,
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        self.events.read(stream, from, limit).await
+        let events = self.events.read(stream, from, limit).await?;
+        Ok(self.apply_upcasters_all(events))
     }
 
     /// Enumerate events whose top-level `meta[field]` equals `value`. See
     /// [`EventBackend::read_by_meta`].
+    ///
+    /// The `meta[field] == value` predicate is evaluated against the
+    /// *stored* event (backends with a native `json_extract`-based
+    /// implementation — the SQLite backend here, for one — filter inside
+    /// the backend before any upcaster gets a chance). Once matching
+    /// events have been selected, they are then run through the
+    /// [`Upcaster`] chain the same as [`Store::read`]. Consumers that mix
+    /// schema evolution with `read_by_meta` should keep the meta fields
+    /// they filter on stable across shape changes — see the
+    /// `read_by_meta` caveat in [`crate::Upcaster`]'s module rustdoc.
     pub async fn read_by_meta(
         &self,
         stream: &StreamId,
@@ -1116,9 +1279,11 @@ impl Store {
         from: Seq,
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        self.events
+        let events = self
+            .events
             .read_by_meta(stream, field, value, from, limit)
-            .await
+            .await?;
+        Ok(self.apply_upcasters_all(events))
     }
 
     /// Current head coordinate of `stream`.
@@ -1191,6 +1356,7 @@ impl Store {
                 continue;
             };
             let events = self.events.read(&stream, head, 1).await?;
+            let events = self.apply_upcasters_all(events);
             let is_tombstoned = events.first().is_some_and(|e| e.kind == TOMBSTONE_KIND);
             if !is_tombstoned {
                 out.push(stream);
@@ -1228,7 +1394,8 @@ impl Store {
                 .read(stream, at, 1)
                 .await
                 .ok()
-                .and_then(|mut evs| (!evs.is_empty()).then(|| evs.remove(0)));
+                .and_then(|mut evs| (!evs.is_empty()).then(|| evs.remove(0)))
+                .map(|e| self.apply_upcasters(e));
             if let Some(event) = event {
                 for sink in &self.sinks {
                     if !sink.accepts(stream) {
@@ -1346,6 +1513,7 @@ impl Store {
 
         let state = self.state_at(stream, target).await?;
         let events = self.events.read(stream, target, 1).await?;
+        let events = self.apply_upcasters_all(events);
         let event = events
             .into_iter()
             .next()
@@ -1468,6 +1636,7 @@ impl Store {
             while cursor < head && !stream_failed {
                 let from = cursor.next();
                 let events = self.events.read(&stream, from, 32).await?;
+                let events = self.apply_upcasters_all(events);
                 if events.is_empty() {
                     break;
                 }
