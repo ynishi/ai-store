@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
 
 [dependencies]
 ai-store-core = { path = "../ai-store-core", version = "0.7.0" }
