@@ -7,8 +7,8 @@
 
 use ai_store_core::Patch;
 use ai_store_core::{
-    CacheBackend, CheckpointBackend, Event, EventBackend, Label, NewEvent, Seq, SqliteBackend,
-    StoreError, StreamId, Timestamp,
+    CacheBackend, CheckpointBackend, Committed, Event, EventBackend, Label, NewEvent, Seq,
+    SqliteBackend, StoreError, StreamId, Timestamp,
 };
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
@@ -115,12 +115,13 @@ impl SqliteEventBackend {
         stream: &StreamId,
         rec: NewEvent,
         at_ms: i64,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let stream_name = stream.as_str().to_string();
         let patch_json = serde_json::to_string(&rec.patch).map_err(to_store_err)?;
         let meta_json = serde_json::to_string(&rec.meta).map_err(to_store_err)?;
         let kind = rec.kind;
-        self.isle
+        let seq = self
+            .isle
             .call(move |conn| {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -143,13 +144,17 @@ impl SqliteEventBackend {
             })
             .await
             .map_err(to_store_err)
-            .map(Seq)
+            .map(Seq)?;
+        Ok(Committed {
+            seq,
+            at: Timestamp(at_ms),
+        })
     }
 }
 
 #[async_trait]
 impl EventBackend for SqliteEventBackend {
-    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Committed, StoreError> {
         self.insert_event(stream, rec, Timestamp::now().0).await
     }
 
@@ -158,7 +163,7 @@ impl EventBackend for SqliteEventBackend {
         stream: &StreamId,
         rec: NewEvent,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         self.insert_event(stream, rec, at.0).await
     }
 

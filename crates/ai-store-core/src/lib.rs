@@ -30,12 +30,13 @@ mod event;
 mod facade;
 mod gate;
 mod id;
+pub mod patch;
 mod sink;
 mod state;
 
 pub use backend::{CacheBackend, CheckpointBackend, EventBackend, SqliteBackend};
 pub use error::{SchemaViolation, StoreError};
-pub use event::{Event, NewEvent};
+pub use event::{Committed, Event, NewEvent};
 pub use facade::{Store, StoreConfig, REVERT_KIND};
 pub use gate::{GateCtx, SchemaGate};
 pub use id::{Label, Seq, StreamId, Timestamp};

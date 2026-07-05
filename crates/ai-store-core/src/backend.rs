@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::StoreError;
-use crate::event::{Event, NewEvent};
+use crate::event::{Committed, Event, NewEvent};
 use crate::id::{Label, Seq, StreamId, Timestamp};
 
 /// Append-only event log backend.
@@ -33,8 +33,10 @@ use crate::id::{Label, Seq, StreamId, Timestamp};
 pub trait EventBackend: Send + Sync {
     /// Append one event. The backend assigns `seq` and `timestamp`.
     ///
-    /// Returns the assigned `Seq` on success.
-    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError>;
+    /// Returns the assigned [`Committed`] (the backend-assigned `seq` and the
+    /// `at` it stamped) on success, so callers do not need a follow-up
+    /// [`EventBackend::read`] just to learn the write's own timestamp.
+    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Committed, StoreError>;
 
     /// Import one event, stamping it with a caller-supplied historical
     /// `Timestamp` instead of the wall-clock time of the call.
@@ -58,7 +60,7 @@ pub trait EventBackend: Send + Sync {
         stream: &StreamId,
         rec: NewEvent,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let _ = (stream, rec, at);
         Err(StoreError::BackendUnsupported("import_event".to_string()))
     }

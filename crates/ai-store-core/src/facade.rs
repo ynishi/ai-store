@@ -99,12 +99,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use json_patch::diff;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::backend::{CacheBackend, CheckpointBackend, EventBackend};
 use crate::error::StoreError;
-use crate::event::{Event, NewEvent};
+use crate::event::{Committed, Event, NewEvent};
 use crate::gate::{GateCtx, SchemaGate};
 use crate::id::{Label, Seq, StreamId, Timestamp};
 use crate::sink::{CatchUpFailure, CatchUpReport, ProjectionSink};
@@ -290,7 +290,13 @@ impl Store {
         }
     }
 
-    /// Append one event to `stream`. Returns the assigned `Seq`.
+    /// Append one event to `stream`. Returns the [`Committed`] coordinates
+    /// (`seq` and the `at` the backend stamped) the backend assigned.
+    ///
+    /// Returning `Committed` instead of a bare `Seq` means a caller that
+    /// needs the write's own timestamp (e.g. to echo it back to a client, or
+    /// to key a downstream cache entry) does not have to immediately
+    /// `read(stream, seq, 1)` the event straight back just to learn `at`.
     ///
     /// The backend stamps `at` with the wall-clock time of this call — use
     /// this for ordinary domain writes. See [`Store::import_event`] for the
@@ -306,7 +312,7 @@ impl Store {
         kind: &str,
         patch: json_patch::Patch,
         meta: Value,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
         self.write_event_locked(stream, kind, patch, meta, None)
@@ -369,7 +375,7 @@ impl Store {
         patch: json_patch::Patch,
         meta: Value,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
         self.write_event_locked(stream, kind, patch, meta, Some(at))
@@ -396,7 +402,7 @@ impl Store {
         patch: json_patch::Patch,
         meta: Value,
         at: Option<Timestamp>,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let current = self.state(stream).await?;
         let has_gates = !self.gates.is_empty();
 
@@ -436,10 +442,11 @@ impl Store {
             patch,
             meta,
         };
-        let seq = match at {
+        let committed = match at {
             Some(at) => self.events.import_event(stream, rec, at).await?,
             None => self.events.append(stream, rec).await?,
         };
+        let seq = committed.seq;
 
         let cache_hit = self.config.cache_stride > 0 && seq.0 % self.config.cache_stride == 0;
         let needs_next = cache_hit || !self.sinks.is_empty();
@@ -486,7 +493,7 @@ impl Store {
             }
         }
 
-        Ok(seq)
+        Ok(committed)
     }
 
     /// Current state of `stream`. Empty streams yield `Value::Null`.
@@ -529,19 +536,69 @@ impl Store {
     /// new event. The prior state stays in the log; recovery from mistakes is
     /// yet another revert.
     ///
+    /// Equivalent to [`Store::revert_with_meta`] with `extra_meta =
+    /// Value::Null` — the appended event's `meta` is exactly `{"revert_to":
+    /// to}`. See [`Store::revert_with_meta`] if the caller needs to attach
+    /// its own attribution (e.g. a consumer-defined id) to the revert event.
+    ///
     /// Holds the per-stream write lock across both the `current`/`target`
     /// reads and the resulting append, so no concurrent write to `stream`
     /// can land between "diff computed against `current`" and "diff
     /// appended" — that gap would otherwise let the reverse patch apply on
     /// top of a `current` that is no longer the stream's real state.
-    pub async fn revert(&self, stream: &StreamId, to: Seq) -> Result<Seq, StoreError> {
+    pub async fn revert(&self, stream: &StreamId, to: Seq) -> Result<Committed, StoreError> {
+        self.revert_with_meta(stream, to, Value::Null).await
+    }
+
+    /// Revert `stream` to the state at `to`, like [`Store::revert`], but let
+    /// the caller merge its own fields into the appended event's `meta`.
+    ///
+    /// Without this, a consumer whose `meta` schema carries its own
+    /// attribution (e.g. a `node_id`, an actor, a correlation id) has no way
+    /// to express that on a revert — `revert`'s generated `meta` is always
+    /// the fixed shape `{"revert_to": to}`, with nowhere for consumer fields
+    /// to go.
+    ///
+    /// ## Merge semantics
+    ///
+    /// If `extra_meta` is a JSON object, its keys are merged into the
+    /// generated `{"revert_to": to}` meta. `"revert_to"` is a reserved key:
+    /// the generated value always wins, so a same-named key in `extra_meta`
+    /// is silently overwritten rather than causing an error — this mirrors
+    /// how [`Store::append`]'s `meta` argument is opaque to the store (no
+    /// key is otherwise reserved), keeping the one exception explicit here
+    /// rather than failing the call.
+    ///
+    /// If `extra_meta` is anything other than a JSON object — including
+    /// `Value::Null` — it is ignored entirely and the appended event's
+    /// `meta` is exactly `{"revert_to": to}`, same as [`Store::revert`]. This
+    /// method does not validate `extra_meta`'s shape beyond that one
+    /// object/non-object branch; a non-object value is silently dropped, not
+    /// rejected, on the reasoning that a revert should not fail solely
+    /// because the caller's optional attribution was malformed.
+    ///
+    /// See [`Store::revert`]'s rustdoc for the write-lock and history
+    /// guarantees this method also provides — the merge described above is
+    /// the only difference between the two.
+    pub async fn revert_with_meta(
+        &self,
+        stream: &StreamId,
+        to: Seq,
+        extra_meta: Value,
+    ) -> Result<Committed, StoreError> {
         let lock = self.stream_lock(stream);
         let _guard = lock.lock().await;
         let current = self.state(stream).await?;
         let target = self.state_at(stream, to).await?;
         let patch = diff(&current, &target);
-        let meta = serde_json::json!({ "revert_to": to.0 });
-        self.write_event_locked(stream, REVERT_KIND, patch, meta, None)
+
+        let mut meta = match extra_meta {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        meta.insert("revert_to".to_string(), Value::from(to.0));
+
+        self.write_event_locked(stream, REVERT_KIND, patch, Value::Object(meta), None)
             .await
     }
 

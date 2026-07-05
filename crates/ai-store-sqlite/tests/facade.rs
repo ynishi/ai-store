@@ -141,8 +141,8 @@ async fn revert_participates_in_the_log() {
         .await
         .unwrap();
 
-    let revert_seq = store.revert(&s, Seq(1)).await.unwrap();
-    assert_eq!(revert_seq, Seq(3));
+    let reverted = store.revert(&s, Seq(1)).await.unwrap();
+    assert_eq!(reverted.seq, Seq(3));
     assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 1 }));
     assert_eq!(store.state_at(&s, Seq(2)).await.unwrap(), json!({ "n": 2 }));
 
@@ -458,7 +458,7 @@ async fn import_event_preserves_caller_supplied_timestamp() {
     let s = StreamId::new("doc");
     let at = Timestamp(1_700_000_000_000);
 
-    let seq = store
+    let committed = store
         .import_event(
             &s,
             "legacy_create",
@@ -468,7 +468,8 @@ async fn import_event_preserves_caller_supplied_timestamp() {
         )
         .await
         .unwrap();
-    assert_eq!(seq, Seq(1));
+    assert_eq!(committed.seq, Seq(1));
+    assert_eq!(committed.at, at);
 
     let events = store.read(&s, Seq(1), 1).await.unwrap();
     assert_eq!(events[0].at, at);

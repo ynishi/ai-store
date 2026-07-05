@@ -6,7 +6,9 @@
 
 use std::sync::Mutex;
 
-use ai_store_core::{Event, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp};
+use ai_store_core::{
+    Committed, Event, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp,
+};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -19,17 +21,18 @@ struct DummyBackend {
 
 #[async_trait]
 impl EventBackend for DummyBackend {
-    async fn append(&self, _stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+    async fn append(&self, _stream: &StreamId, rec: NewEvent) -> Result<Committed, StoreError> {
         let mut events = self.events.lock().unwrap();
         let seq = Seq((events.len() + 1) as u64);
+        let at = Timestamp::now();
         events.push(Event {
             seq,
             kind: rec.kind,
             patch: rec.patch,
             meta: rec.meta,
-            at: Timestamp::now(),
+            at,
         });
-        Ok(seq)
+        Ok(Committed { seq, at })
     }
 
     async fn read(

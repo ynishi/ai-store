@@ -9,7 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai-store-core::Store::revert_with_meta`: like `revert`, but merges
+  caller-supplied fields into the appended revert event's `meta` instead of
+  always writing the fixed `{"revert_to": to}` shape. `"revert_to"` is a
+  reserved key — a same-named field in the caller's `extra_meta` is
+  overwritten by the generated value rather than erroring. `revert` is now
+  defined in terms of `revert_with_meta(stream, to, Value::Null)`.
+- `ai-store-core::patch` module: `add`/`replace`/`remove` helpers and a
+  chainable `Builder` for constructing single- or multi-operation
+  `json_patch::Patch` values without hand-assembling JSON Patch documents.
+
 ### Changed
+
+- **BREAKING**: `EventBackend::append` / `EventBackend::import_event` now
+  return `Result<Committed, StoreError>` instead of `Result<Seq, StoreError>`
+  (new struct `Committed { seq, at }`). `Store::append`, `Store::import_event`,
+  and `Store::revert` / `revert_with_meta` follow suit, as do the
+  `ai-store-sync::BlockingStore` mirrors of those three methods. Consumers
+  that previously round-tripped through `read(stream, seq, 1)` just to learn
+  the backend-stamped `at` can now read it directly off the returned
+  `Committed` value.
 
 ### Deprecated
 

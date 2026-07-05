@@ -49,9 +49,9 @@ async fn append_assigns_gap_free_monotonic_seq_from_one() {
         .await
         .unwrap();
 
-    assert_eq!(a, Seq(1));
-    assert_eq!(b, Seq(2));
-    assert_eq!(c, Seq(3));
+    assert_eq!(a.seq, Seq(1));
+    assert_eq!(b.seq, Seq(2));
+    assert_eq!(c.seq, Seq(3));
     assert_eq!(be.head(&s).await.unwrap(), Some(Seq(3)));
 }
 
@@ -244,10 +244,18 @@ async fn seq_at_time_returns_greatest_seq_at_or_before_timestamp() {
 
     // Append with real wall-clock, sleeping between so that ms-resolution
     // timestamps are strictly distinct even on fast machines.
-    let seq1 = be.append(&s, new_event("a", empty_patch())).await.unwrap();
+    let seq1 = be
+        .append(&s, new_event("a", empty_patch()))
+        .await
+        .unwrap()
+        .seq;
     let t1 = be.read(&s, seq1, 1).await.unwrap()[0].at;
     std::thread::sleep(std::time::Duration::from_millis(3));
-    let seq2 = be.append(&s, new_event("b", empty_patch())).await.unwrap();
+    let seq2 = be
+        .append(&s, new_event("b", empty_patch()))
+        .await
+        .unwrap()
+        .seq;
     let t2 = be.read(&s, seq2, 1).await.unwrap()[0].at;
     assert!(t2.0 > t1.0, "sleep did not produce a distinct ms timestamp");
 
@@ -324,11 +332,12 @@ async fn import_event_assigns_next_seq_and_preserves_supplied_timestamp() {
     be.append(&s, new_event("k1", empty_patch())).await.unwrap();
 
     let at = Timestamp(1_700_000_000_000);
-    let seq = be
+    let committed = be
         .import_event(&s, new_event("k2", empty_patch()), at)
         .await
         .unwrap();
-    assert_eq!(seq, Seq(2));
+    assert_eq!(committed.seq, Seq(2));
+    assert_eq!(committed.at, at);
     assert_eq!(be.head(&s).await.unwrap(), Some(Seq(2)));
 
     let events = be.read(&s, Seq(2), 1).await.unwrap();
@@ -341,11 +350,11 @@ async fn import_event_on_empty_stream_starts_at_seq_one() {
     let s = StreamId::new("s");
     let at = Timestamp(1_700_000_000_000);
 
-    let seq = be
+    let committed = be
         .import_event(&s, new_event("k1", empty_patch()), at)
         .await
         .unwrap();
-    assert_eq!(seq, Seq(1));
+    assert_eq!(committed.seq, Seq(1));
     assert_eq!(be.head(&s).await.unwrap(), Some(Seq(1)));
 }
 
@@ -401,4 +410,21 @@ async fn event_patch_round_trips_through_append_and_read() {
     let expected = serde_json::to_value(set_root_patch()).unwrap();
     let observed = serde_json::to_value(&ev.patch).unwrap();
     assert_eq!(observed, expected);
+}
+
+/// `Committed.at` (returned inline from `append`) must be exactly the `at`
+/// a follow-up `read` reports for that same event — the round-trip this
+/// type exists to make unnecessary.
+#[tokio::test]
+async fn append_returned_at_matches_the_read_back_event() {
+    let be = MemEventBackend::new();
+    let s = StreamId::new("s");
+
+    let committed = be
+        .append(&s, new_event("init", empty_patch()))
+        .await
+        .unwrap();
+
+    let events = be.read(&s, committed.seq, 1).await.unwrap();
+    assert_eq!(events[0].at, committed.at);
 }

@@ -46,7 +46,7 @@ pub use sink::{BlockingSink, Dispatch, SyncProjectionSink};
 
 use std::sync::Arc;
 
-use ai_store_core::{Event, Label, Patch, Seq, Store, StoreError, StreamId, Timestamp};
+use ai_store_core::{Committed, Event, Label, Patch, Seq, Store, StoreError, StreamId, Timestamp};
 use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 
@@ -129,7 +129,7 @@ impl BlockingStore {
         kind: &str,
         patch: Patch,
         meta: Value,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         self.driver
             .block_on(self.inner.append(stream, kind, patch, meta))
     }
@@ -142,7 +142,7 @@ impl BlockingStore {
         patch: Patch,
         meta: Value,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         self.driver
             .block_on(self.inner.import_event(stream, kind, patch, meta, at))
     }
@@ -158,8 +158,19 @@ impl BlockingStore {
     }
 
     /// See [`Store::revert`].
-    pub fn revert(&self, stream: &StreamId, to: Seq) -> Result<Seq, StoreError> {
+    pub fn revert(&self, stream: &StreamId, to: Seq) -> Result<Committed, StoreError> {
         self.driver.block_on(self.inner.revert(stream, to))
+    }
+
+    /// See [`Store::revert_with_meta`].
+    pub fn revert_with_meta(
+        &self,
+        stream: &StreamId,
+        to: Seq,
+        extra_meta: Value,
+    ) -> Result<Committed, StoreError> {
+        self.driver
+            .block_on(self.inner.revert_with_meta(stream, to, extra_meta))
     }
 
     /// See [`Store::read`].

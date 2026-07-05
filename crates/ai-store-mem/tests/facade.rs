@@ -123,8 +123,8 @@ async fn revert_appends_as_new_event_and_restores_prior_state() {
         .unwrap();
 
     // revert to seq 1 should append a fourth event whose net effect is n=1.
-    let revert_seq = store.revert(&s, Seq(1)).await.unwrap();
-    assert_eq!(revert_seq, Seq(4));
+    let reverted = store.revert(&s, Seq(1)).await.unwrap();
+    assert_eq!(reverted.seq, Seq(4));
     assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 1 }));
 
     // History remains intact — the intermediate n=2 state is still readable.
@@ -134,6 +134,120 @@ async fn revert_appends_as_new_event_and_restores_prior_state() {
     // We can revert the revert — restoration is symmetric.
     store.revert(&s, Seq(3)).await.unwrap();
     assert_eq!(store.state(&s).await.unwrap(), json!({ "n": 3 }));
+}
+
+// ---- revert_with_meta -----------------------------------------------------
+
+#[tokio::test]
+async fn revert_with_meta_merges_extra_meta_into_the_appended_event() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    let reverted = store
+        .revert_with_meta(&s, Seq(1), json!({ "node_id": "abc123" }))
+        .await
+        .unwrap();
+
+    let events = store.read(&s, reverted.seq, 1).await.unwrap();
+    assert_eq!(
+        events[0].meta,
+        json!({ "node_id": "abc123", "revert_to": 1 })
+    );
+}
+
+#[tokio::test]
+async fn revert_with_meta_reserved_revert_to_key_always_wins() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // A caller-supplied `revert_to` in extra_meta must not be able to spoof
+    // the target seq the store actually reverted to.
+    let reverted = store
+        .revert_with_meta(&s, Seq(1), json!({ "revert_to": 999 }))
+        .await
+        .unwrap();
+
+    let events = store.read(&s, reverted.seq, 1).await.unwrap();
+    assert_eq!(events[0].meta, json!({ "revert_to": 1 }));
+}
+
+#[tokio::test]
+async fn revert_with_meta_ignores_non_object_extra_meta() {
+    let store = store_no_gate_no_sink();
+    let s = StreamId::new("doc");
+
+    store
+        .append(
+            &s,
+            "init",
+            patch(json!([{ "op": "add", "path": "", "value": { "n": 1 } }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            &s,
+            "bump",
+            patch(json!([{ "op": "replace", "path": "/n", "value": 2 }])),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Value::Null (== plain `revert`'s own extra_meta) and any other
+    // non-object shape are silently dropped rather than rejected.
+    let reverted_null = store
+        .revert_with_meta(&s, Seq(1), Value::Null)
+        .await
+        .unwrap();
+    let events = store.read(&s, reverted_null.seq, 1).await.unwrap();
+    assert_eq!(events[0].meta, json!({ "revert_to": 1 }));
+
+    let reverted_string = store
+        .revert_with_meta(&s, Seq(1), json!("not an object"))
+        .await
+        .unwrap();
+    let events = store.read(&s, reverted_string.seq, 1).await.unwrap();
+    assert_eq!(events[0].meta, json!({ "revert_to": 1 }));
 }
 
 // ---- gate ---------------------------------------------------------------
@@ -447,7 +561,7 @@ async fn import_event_preserves_caller_supplied_timestamp() {
     let s = StreamId::new("doc");
     let at = Timestamp(1_700_000_000_000);
 
-    let seq = store
+    let committed = store
         .import_event(
             &s,
             "legacy_create",
@@ -457,7 +571,8 @@ async fn import_event_preserves_caller_supplied_timestamp() {
         )
         .await
         .unwrap();
-    assert_eq!(seq, Seq(1));
+    assert_eq!(committed.seq, Seq(1));
+    assert_eq!(committed.at, at);
 
     let events = store.read(&s, Seq(1), 1).await.unwrap();
     assert_eq!(events[0].at, at);

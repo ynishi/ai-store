@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ai_store_core::{Event, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp};
+use ai_store_core::{
+    Committed, Event, EventBackend, Label, NewEvent, Seq, StoreError, StreamId, Timestamp,
+};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -47,7 +49,7 @@ impl MemEventBackend {
         stream: &StreamId,
         rec: NewEvent,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         let mut inner = self.inner.lock().await;
         let state = inner.entry(stream.clone()).or_default();
         let seq = match state.head_seq() {
@@ -61,13 +63,13 @@ impl MemEventBackend {
             meta: rec.meta,
             at,
         });
-        Ok(seq)
+        Ok(Committed { seq, at })
     }
 }
 
 #[async_trait]
 impl EventBackend for MemEventBackend {
-    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+    async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Committed, StoreError> {
         self.push_event(stream, rec, Timestamp::now()).await
     }
 
@@ -76,7 +78,7 @@ impl EventBackend for MemEventBackend {
         stream: &StreamId,
         rec: NewEvent,
         at: Timestamp,
-    ) -> Result<Seq, StoreError> {
+    ) -> Result<Committed, StoreError> {
         self.push_event(stream, rec, at).await
     }
 

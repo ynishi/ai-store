@@ -69,7 +69,7 @@ fn owned_runtime_append_state_read_roundtrip() {
             json!({}),
         )
         .unwrap();
-    assert_eq!(seq1, Seq(1));
+    assert_eq!(seq1.seq, Seq(1));
 
     let seq2 = bs
         .append(
@@ -79,7 +79,7 @@ fn owned_runtime_append_state_read_roundtrip() {
             json!({}),
         )
         .unwrap();
-    assert_eq!(seq2, Seq(2));
+    assert_eq!(seq2.seq, Seq(2));
 
     assert_eq!(bs.state(&s).unwrap(), json!({ "n": 1 }));
     assert_eq!(bs.head(&s).unwrap(), Some(Seq(2)));
@@ -110,7 +110,7 @@ fn owned_runtime_revert_appends_event() {
     .unwrap();
 
     let seq_reverted = bs.revert(&s, Seq(1)).unwrap();
-    assert_eq!(seq_reverted, Seq(3));
+    assert_eq!(seq_reverted.seq, Seq(3));
     assert_eq!(bs.state(&s).unwrap(), json!({ "n": 0 }));
     assert_eq!(bs.head(&s).unwrap(), Some(Seq(3)));
 }
@@ -124,7 +124,7 @@ fn import_event_preserves_caller_supplied_timestamp_via_blocking_facade() {
     let s = StreamId::new("doc");
     let at = Timestamp(1_700_000_000_000);
 
-    let seq = bs
+    let committed = bs
         .import_event(
             &s,
             "legacy_create",
@@ -133,7 +133,8 @@ fn import_event_preserves_caller_supplied_timestamp_via_blocking_facade() {
             at,
         )
         .unwrap();
-    assert_eq!(seq, Seq(1));
+    assert_eq!(committed.seq, Seq(1));
+    assert_eq!(committed.at, at);
 
     let events = bs.read(&s, Seq(1), 1).unwrap();
     assert_eq!(events[0].at, at);
